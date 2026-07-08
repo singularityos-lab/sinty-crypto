@@ -52,6 +52,9 @@ fn scratchDir() []const u8 {
     return bo.scratch_dir;
 }
 extern fn chmod(path: [*:0]const u8, mode: c_uint) c_int;
+extern fn fchmod(fd: c_int, mode: c_uint) c_int;
+extern fn fchown(fd: c_int, owner: c_uint, group: c_uint) c_int;
+const O_NOFOLLOW: c_int = 0o400000;
 fn ensureScratch() void {
     var b: [512]u8 = undefined;
     const z = std.fmt.bufPrintZ(&b, "{s}", .{scratchDir()}) catch return;
@@ -365,6 +368,30 @@ fn cmdRecover(args: []const [:0]const u8) u8 {
     return if (tpmSeal(sd, &p, &ce, new)) 0 else 1;
 }
 
+// secureDir creates dir `path` with `mode` without a shell and fail-closed: mkdir sets
+// the mode atomically, then it opens the dir with O_NOFOLLOW (a pre-planted symlink makes
+// this fail) and re-asserts mode/owner on the fd, so there is no path TOCTOU. Returns false
+// on any anomaly (symlink, not a directory, chmod/chown refused).
+fn secureDir(path: [*:0]const u8, mode: c_uint, root_only: bool) bool {
+    _ = mkdir(path, mode & 0o777);
+    const fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, 0);
+    if (fd < 0) return false;
+    defer _ = close(fd);
+    if (fchmod(fd, mode) != 0) return false;
+    if (root_only and fchown(fd, 0, 0) != 0) return false;
+    return true;
+}
+
+// cmdMkdirs creates the early-boot sinty runtime dirs, replacing a /bin/sh -c one-liner
+// in the boot unit (Tier-1 hardening: no shell in the pre-sysinit path):
+//   /run/sinty     1777           session registry (users write session-<uid>)
+//   /run/sintykey  0700 root:root transient CE-key/PIN scratch
+fn cmdMkdirs(_: []const [:0]const u8) u8 {
+    if (!secureDir("/run/sinty", 0o1777, false)) die("mkdirs: /run/sinty");
+    if (!secureDir("/run/sintykey", 0o700, true)) die("mkdirs: /run/sintykey");
+    return 0;
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     var it = std.process.Args.Iterator.init(init.args);
     var argv: [32][:0]const u8 = undefined;
@@ -375,8 +402,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         n += 1;
     }
     const args = argv[0..n];
-    if (args.len < 2) die("usage: sintykey <provision|change-pin|verify-pin|unseal|recover> [flags]");
+    if (args.len < 2) die("usage: sintykey <provision|change-pin|verify-pin|unseal|recover|mkdirs> [flags]");
     const cmd = args[1];
+    if (std.mem.eql(u8, cmd, "mkdirs")) return cmdMkdirs(args);
     if (std.mem.eql(u8, cmd, "provision")) return cmdProvision(args);
     if (std.mem.eql(u8, cmd, "change-pin")) return cmdChangePin(args);
     if (std.mem.eql(u8, cmd, "verify-pin")) return cmdVerifyPin(args);
