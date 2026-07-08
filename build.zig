@@ -92,7 +92,7 @@ pub fn build(b: *std.Build) void {
     tpm_be.root_module.linkSystemLibrary("tss2-mu", .{});
     tpm_be.root_module.linkSystemLibrary("tss2-rc", .{});
     tpm_be.root_module.linkSystemLibrary("tss2-tctildr", .{});
-    tpm_be.root_module.linkSystemLibrary("dl", .{});
+    tpm_be.linker_allow_shlib_undefined = true;
     b.installArtifact(tpm_be);
 
     const t = b.addTest(.{ .root_module = b.createModule(.{
