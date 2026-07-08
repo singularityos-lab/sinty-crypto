@@ -148,7 +148,7 @@ test "recovery wrap roundtrip + wrong secret rejected" {
     const secret: [*:0]const u8 = @ptrCast(&rec);
 
     var blob: [128]u8 = undefined;
-    var blen: usize = 0;
+    var blen: usize = blob.len; // IN: buffer capacity
     try std.testing.expectEqual(@as(c_int, 0), sintykey_recovery_wrap(&k, secret, &blob, &blen));
 
     var out: Key = undefined;
