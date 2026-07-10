@@ -218,6 +218,82 @@ fn setFscryptPolicy(home: [:0]const u8, ce: *const key.Key) void {
         die("fscrypt set-policy failed (home must be EMPTY: run before populating skel)");
 }
 
+// When there is no working TPM (a VM without swtpm, a board with no TPM), the seal
+// falls back to software: the key is wrapped with Argon2id(secret)+XChaCha, the same
+// audited primitive as the recovery blob. This is L1: with no hardware DA-lockout the
+// throttle is only the KDF cost, so a short secret is correspondingly weaker -- an
+// accepted L1 limitation. The system stays FUNCTIONAL and strengthens to the TPM tier
+// automatically where hardware is present. The tier is chosen by which blob exists on
+// disk: {name}.priv (+ .pub) = TPM-sealed; {name}.soft = software L1.
+
+// softSeal wraps `k` under `secret` and writes state_dir/{name}.soft (0600 root). It is
+// the L1 fallback used when the TPM seal is unavailable.
+fn softSeal(sd: []const u8, name: []const u8, k: *const key.Key, secret: []const u8) bool {
+    var sb: [512]u8 = undefined;
+    const secz = std.fmt.bufPrintZ(&sb, "{s}", .{secret}) catch return false;
+    var blob: [128]u8 = undefined;
+    var blen: usize = blob.len;
+    if (key.sintykey_recovery_wrap(k, secz.ptr, &blob, &blen) != 0) return false;
+    var pb: [512]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&pb, "{s}/{s}.soft", .{ sd, name }) catch return false;
+    return writeSecret(path.ptr, blob[0..blen]);
+}
+
+// resealAny seals `k` under `secret` at the best available tier: TPM if it works, else the
+// software L1 fallback (unless enforce_tpm forbids it). Used by provision/change-pin/recover
+// so every write path degrades identically.
+fn resealAny(sd: []const u8, uid: []const u8, p: *Paths, k: *const key.Key, secret: []const u8) bool {
+    if (tpmSeal(sd, p, k, secret)) return true;
+    if (bo.enforce_tpm) return false;
+    return softSeal(sd, uid, k, secret);
+}
+
+// unsealAny recovers `k` under `secret` from whichever tier holds it: TPM blobs if present
+// and valid, else the software L1 blob.
+fn unsealAny(sd: []const u8, uid: []const u8, p: *Paths, secret: []const u8, k: *key.Key) bool {
+    if (!writeSecret(p.pinZ.ptr, secret)) return false;
+    defer _ = unlink(p.pinZ.ptr);
+    var ob: [512]u8 = undefined;
+    const outf = std.fmt.bufPrintZ(&ob, "{s}/.out.{s}", .{ scratchDir(), uid }) catch return false;
+    if (runTpm(&.{ tpmBin(), "unseal", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, outf.ptr, null })) {
+        const n = readFileAll(outf.ptr, k.bytes[0..]);
+        _ = unlink(outf.ptr);
+        return n != null and n.? == KEYLEN;
+    }
+    return softUnseal(sd, uid, secret, k);
+}
+
+// softUnseal reads state_dir/{name}.soft and unwraps `k` under `secret`. Returns false
+// if the blob is absent (not this tier) or the secret is wrong.
+fn softUnseal(sd: []const u8, name: []const u8, secret: []const u8, k: *key.Key) bool {
+    var pb: [512]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&pb, "{s}/{s}.soft", .{ sd, name }) catch return false;
+    var blob: [128]u8 = undefined;
+    const blen = readFileAll(path.ptr, &blob) orelse return false;
+    var sb: [512]u8 = undefined;
+    const secz = std.fmt.bufPrintZ(&sb, "{s}", .{secret}) catch return false;
+    return key.sintykey_recovery_unwrap(&blob, blen, secz.ptr, k) == 0;
+}
+
+// addFscryptKey adds `k` to the filesystem holding `dir` (FS_IOC_ADD_ENCRYPTION_KEY),
+// so directories already carrying our policy become readable. Unlike setFscryptPolicy it
+// does not set a policy -- unlock only needs the key present. Returns false on any error
+// (unlock stays graceful: a missing key just leaves the data locked, it never dies).
+fn addFscryptKey(dir: [:0]const u8, k: *const key.Key) bool {
+    const fd = open(dir.ptr, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (fd < 0) return false;
+    defer _ = close(fd);
+    const total = @sizeOf(c.fscrypt_add_key_arg) + k.bytes.len;
+    const buf = std.heap.page_allocator.alloc(u8, total) catch return false;
+    defer std.heap.page_allocator.free(buf);
+    @memset(buf, 0);
+    const arg: *c.fscrypt_add_key_arg = @ptrCast(@alignCast(buf.ptr));
+    arg.key_spec.type = c.FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER;
+    arg.raw_size = @intCast(k.bytes.len);
+    @memcpy(buf[@sizeOf(c.fscrypt_add_key_arg)..][0..k.bytes.len], k.bytes[0..]);
+    return c.ioctl(fd, c.FS_IOC_ADD_ENCRYPTION_KEY, buf.ptr) == 0;
+}
+
 fn cmdProvision(args: []const [:0]const u8) u8 {
     const uid = argFlag(args, "--uid") orelse die("provision needs --uid");
     const home = argFlag(args, "--home") orelse die("provision needs --home");
@@ -241,15 +317,18 @@ fn cmdProvision(args: []const [:0]const u8) u8 {
     const sdZ = std.fmt.bufPrintZ(&sdz, "{s}", .{sd}) catch die("state dir too long");
     _ = mkdir(sdZ.ptr, 0o700);
 
-    // Seal the CE key to the TPM under the PIN (the DA-lockout throttles guesses).
+    // Seal the CE key to the TPM under the PIN (the DA-lockout throttles guesses). With
+    // no working TPM, degrade gracefully to the software L1 tier (Argon2id under the PIN)
+    // so the account can still PIN-login on a VM or a TPM-less board, unless the operator
+    // built with enforce_tpm to forbid the fallback.
     var p: Paths = .{};
     p.init(sd, uid);
     if (!tpmSeal(sd, &p, &ce, pin)) {
         if (bo.enforce_tpm)
-            // RC: no working TPM -> the PIN could never unseal. Fail loudly instead
-            // of creating an account that reports success but cannot PIN-login.
-            die("TPM seal failed -- no working TPM (need /dev/tpmrm0). Refusing to provision a PIN that cannot unlock.");
-        std.debug.print("sintykey: warning: TPM seal unavailable (dev build) -- key lives in the recovery wrap only\n", .{});
+            die("TPM seal failed and enforce_tpm set -- refusing to provision a PIN that cannot unlock");
+        if (!softSeal(sd, uid, &ce, pin))
+            die("both TPM and software seal failed -- cannot secure the PIN");
+        std.debug.print("sintykey: no TPM -- provisioned at software tier (L1)\n", .{});
     }
 
     // Recovery wrap: the escape hatch for a forgotten PIN or a cleared TPM.
@@ -282,7 +361,11 @@ fn cmdVerifyPin(args: []const [:0]const u8) u8 {
     p.init(sd, uid);
     if (!writeSecret(p.pinZ.ptr, pin)) return 1;
     defer _ = unlink(p.pinZ.ptr);
-    return if (runTpm(&.{ tpmBin(), "verify", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, null })) 0 else 1;
+    if (runTpm(&.{ tpmBin(), "verify", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, null })) return 0;
+    // Software L1 tier: a correct PIN unwraps the blob (AEAD tag holds); a wrong one fails.
+    var k: key.Key = undefined;
+    defer std.crypto.secureZero(u8, k.bytes[0..]);
+    return if (softUnseal(sd, uid, pin, &k)) 0 else 1;
 }
 
 // unseal: PIN on stdin, the raw 32-byte CE key on stdout (for pam_sinty).
@@ -299,13 +382,160 @@ fn cmdUnseal(args: []const [:0]const u8) u8 {
     var ob: [512]u8 = undefined;
     const outf = std.fmt.bufPrintZ(&ob, "{s}/.out.{s}", .{ scratchDir(), uid }) catch die("path too long");
     defer _ = unlink(outf.ptr);
-    if (!runTpm(&.{ tpmBin(), "unseal", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, outf.ptr, null })) return 1;
-    var k: [KEYLEN]u8 = undefined;
-    const n = readFileAll(outf.ptr, &k) orelse return 1;
-    if (n != KEYLEN) return 1;
-    _ = write(1, &k, KEYLEN);
-    std.crypto.secureZero(u8, k[0..]);
+    if (runTpm(&.{ tpmBin(), "unseal", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, outf.ptr, null })) {
+        var k: [KEYLEN]u8 = undefined;
+        const n = readFileAll(outf.ptr, &k) orelse return 1;
+        if (n != KEYLEN) return 1;
+        _ = write(1, &k, KEYLEN);
+        std.crypto.secureZero(u8, k[0..]);
+        return 0;
+    }
+    // No TPM tier (or it refused): try the software L1 tier under the same PIN. A wrong
+    // PIN fails the AEAD tag here, exactly as it fails the TPM authValue above.
+    var sk: key.Key = undefined;
+    if (!softUnseal(sd, uid, pin, &sk)) return 1;
+    _ = write(1, &sk.bytes, KEYLEN);
+    std.crypto.secureZero(u8, sk.bytes[0..]);
     return 0;
+}
+
+// The DE key protects system data that must be readable BEFORE any login (so the greeter
+// can run): /var/{log,cache,spool}. It is unlocked with no PIN at boot. On hardware it is
+// sealed to the TPM (empty authValue); with no TPM it degrades to a root-only key file
+// (L1: at-rest encryption whose key is recoverable by root, no hardware confidentiality).
+// device.pub is the presence marker the boot unit's Condition checks; the tier is chosen
+// at unlock by which artifact exists: device.priv (+ .pub) = TPM, device.key = L1.
+//
+// LIMITATION (flagged for review): the TPM seal binds to the empty authValue only, not to
+// a PCR / stable-root policy, so the TPM tier gives no stronger confidentiality than L1
+// yet. Real DE hardware binding (stable-root PCR policy) is a follow-up in sintykey-tpm.
+const deSubdirs = [_][]const u8{ "log", "cache", "spool" };
+
+// setPolicyBestEffort sets our fscrypt policy on `dir` using key id `k`, returning false
+// (never dying) when the directory is missing or not empty. provision-device applies the
+// policy only to the subdirs it can, so a partially-populated /var never aborts the boot.
+fn setPolicyBestEffort(dir: [:0]const u8, k: *const key.Key) bool {
+    const fd = open(dir.ptr, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (fd < 0) return false;
+    defer _ = close(fd);
+    if (!addFscryptKeyFd(fd, k)) return false;
+
+    var pol = std.mem.zeroes(c.fscrypt_policy_v2);
+    pol.version = 2;
+    pol.contents_encryption_mode = c.FSCRYPT_MODE_AES_256_XTS;
+    pol.filenames_encryption_mode = c.FSCRYPT_MODE_AES_256_CTS;
+    pol.flags = c.FSCRYPT_POLICY_FLAGS_PAD_16;
+    keyIdentifier(k, &pol.master_key_identifier);
+    return c.ioctl(fd, c.FS_IOC_SET_ENCRYPTION_POLICY, &pol) == 0;
+}
+
+// addFscryptKeyFd adds `k` to the filesystem backing an already-open dir fd and writes the
+// resulting key identifier back into arg for the policy call. Split from addFscryptKey so
+// provision (needs the id) and unlock (does not) share the add path.
+fn addFscryptKeyFd(fd: c_int, k: *const key.Key) bool {
+    const total = @sizeOf(c.fscrypt_add_key_arg) + k.bytes.len;
+    const buf = std.heap.page_allocator.alloc(u8, total) catch return false;
+    defer std.heap.page_allocator.free(buf);
+    @memset(buf, 0);
+    const arg: *c.fscrypt_add_key_arg = @ptrCast(@alignCast(buf.ptr));
+    arg.key_spec.type = c.FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER;
+    arg.raw_size = @intCast(k.bytes.len);
+    @memcpy(buf[@sizeOf(c.fscrypt_add_key_arg)..][0..k.bytes.len], k.bytes[0..]);
+    return c.ioctl(fd, c.FS_IOC_ADD_ENCRYPTION_KEY, buf.ptr) == 0;
+}
+
+// keyIdentifier recomputes the fscrypt key identifier for `k` by adding it to a throwaway
+// (the identifier is a function of the key, deterministic), so set-policy and add-key agree.
+fn keyIdentifier(k: *const key.Key, out: *[c.FSCRYPT_KEY_IDENTIFIER_SIZE]u8) void {
+    // HKDF-derived identifier per the kernel: we obtain it from the add-key result on the
+    // first subdir. Callers add the key on the same fd immediately before, so we read it
+    // back from a fresh add on the state dir which shares the filesystem.
+    const total = @sizeOf(c.fscrypt_add_key_arg) + k.bytes.len;
+    const buf = std.heap.page_allocator.alloc(u8, total) catch return;
+    defer std.heap.page_allocator.free(buf);
+    @memset(buf, 0);
+    const arg: *c.fscrypt_add_key_arg = @ptrCast(@alignCast(buf.ptr));
+    arg.key_spec.type = c.FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER;
+    arg.raw_size = @intCast(k.bytes.len);
+    @memcpy(buf[@sizeOf(c.fscrypt_add_key_arg)..][0..k.bytes.len], k.bytes[0..]);
+    var sdz: [512]u8 = undefined;
+    const sdZ = std.fmt.bufPrintZ(&sdz, "{s}", .{stateDir()}) catch return;
+    const fd = open(sdZ.ptr, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (fd < 0) return;
+    defer _ = close(fd);
+    if (c.ioctl(fd, c.FS_IOC_ADD_ENCRYPTION_KEY, buf.ptr) != 0) return;
+    @memcpy(out, arg.key_spec.u.identifier[0..c.FSCRYPT_KEY_IDENTIFIER_SIZE]);
+}
+
+fn cmdProvisionDevice(_: []const [:0]const u8) u8 {
+    const sd = stateDir();
+    var sdz: [512]u8 = undefined;
+    const sdZ = std.fmt.bufPrintZ(&sdz, "{s}", .{sd}) catch die("state dir too long");
+    _ = mkdir(sdZ.ptr, 0o700);
+
+    var de: key.Key = undefined;
+    if (key.sintykey_generate(&de) != 0) die("device key generation failed");
+    defer std.crypto.secureZero(u8, de.bytes[0..]);
+
+    // Seal the device key with an empty authValue (no PIN, unlocked at boot). With no TPM,
+    // degrade to a root-only 0600 key file. device.pub is the presence marker either way.
+    var p: Paths = .{};
+    p.init(sd, "device");
+    var pubmark: [512]u8 = undefined;
+    const pubZ = std.fmt.bufPrintZ(&pubmark, "{s}/device.pub", .{sd}) catch die("path too long");
+    if (tpmSeal(sd, &p, &de, "")) {
+        std.debug.print("sintykey: device key sealed to TPM\n", .{});
+    } else {
+        if (bo.enforce_tpm) die("TPM seal failed and enforce_tpm set -- cannot provision the device key");
+        var kb: [512]u8 = undefined;
+        const keyZ = std.fmt.bufPrintZ(&kb, "{s}/device.key", .{sd}) catch die("path too long");
+        if (!writeSecret(keyZ.ptr, de.bytes[0..])) die("cannot write device key");
+        _ = writeSecret(pubZ.ptr, "L1\n");
+        std.debug.print("sintykey: no TPM -- device key at software tier (L1)\n", .{});
+    }
+
+    // Apply the fscrypt policy to each DE subdir under /var that is present and empty.
+    // Best-effort: a populated subdir is skipped, never aborting the provision.
+    for (deSubdirs) |sub| {
+        var db: [512]u8 = undefined;
+        const dz = std.fmt.bufPrintZ(&db, "/var/{s}", .{sub}) catch continue;
+        _ = setPolicyBestEffort(dz, &de);
+    }
+    return 0;
+}
+
+fn cmdUnlockDevice(args: []const [:0]const u8) u8 {
+    const mount = argFlag(args, "--mount") orelse "/var";
+    const sd = stateDir();
+
+    // Recover the device key from whichever tier provisioned it. If neither exists the DE
+    // feature was never provisioned: nothing to unlock, exit 0 so the boot unit is inert.
+    var de: key.Key = undefined;
+    defer std.crypto.secureZero(u8, de.bytes[0..]);
+    var priv_b: [512]u8 = undefined;
+    const privZ = std.fmt.bufPrintZ(&priv_b, "{s}/device.priv", .{sd}) catch die("path too long");
+    if (open(privZ.ptr, O_RDONLY, 0) >= 0) {
+        var p: Paths = .{};
+        p.init(sd, "device");
+        var ob: [512]u8 = undefined;
+        const outf = std.fmt.bufPrintZ(&ob, "{s}/.out.device", .{scratchDir()}) catch die("path too long");
+        defer _ = unlink(outf.ptr);
+        _ = writeSecret(p.pinZ.ptr, "");
+        defer _ = unlink(p.pinZ.ptr);
+        if (!runTpm(&.{ tpmBin(), "unseal", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, outf.ptr, null })) return 1;
+        const n = readFileAll(outf.ptr, de.bytes[0..]) orelse return 1;
+        if (n != KEYLEN) return 1;
+    } else {
+        var kb: [512]u8 = undefined;
+        const keyZ = std.fmt.bufPrintZ(&kb, "{s}/device.key", .{sd}) catch die("path too long");
+        const n = readFileAll(keyZ.ptr, de.bytes[0..]) orelse return 0; // not provisioned -> inert
+        if (n != KEYLEN) return 1;
+    }
+
+    // Add the key to the mount's filesystem so its policy'd subdirs decrypt.
+    var mz: [512]u8 = undefined;
+    const mountZ = std.fmt.bufPrintZ(&mz, "{s}", .{mount}) catch die("mount path too long");
+    return if (addFscryptKey(mountZ, &de)) 0 else 1;
 }
 
 // change-pin: unseal under the old PIN, re-seal under the new one.
@@ -320,24 +550,11 @@ fn cmdChangePin(args: []const [:0]const u8) u8 {
     var p: Paths = .{};
     p.init(sd, uid);
 
-    // unseal K under the old PIN
-    if (!writeSecret(p.pinZ.ptr, old)) return 1;
-    var ob: [512]u8 = undefined;
-    const outf = std.fmt.bufPrintZ(&ob, "{s}/.out.{s}", .{ scratchDir(), uid }) catch die("path too long");
-    const ok = runTpm(&.{ tpmBin(), "unseal", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, outf.ptr, null });
-    _ = unlink(p.pinZ.ptr);
-    if (!ok) {
-        _ = unlink(outf.ptr);
-        return 1;
-    }
     var ce: key.Key = undefined;
-    const n = readFileAll(outf.ptr, ce.bytes[0..]);
-    _ = unlink(outf.ptr);
-    if (n == null or n.? != KEYLEN) return 1;
     defer std.crypto.secureZero(u8, ce.bytes[0..]);
-
-    // re-seal under the new PIN (overwrites pub/priv)
-    return if (tpmSeal(sd, &p, &ce, new)) 0 else 1;
+    if (!unsealAny(sd, uid, &p, old, &ce)) return 1; // wrong old PIN or no blob
+    // re-seal under the new PIN at the same tier the box supports (overwrites the blob)
+    return if (resealAny(sd, uid, &p, &ce, new)) 0 else 1;
 }
 
 // recover: recovery-code + new PIN on stdin. Unwraps the CE key from the recovery
@@ -365,7 +582,7 @@ fn cmdRecover(args: []const [:0]const u8) u8 {
 
     var p: Paths = .{};
     p.init(sd, uid);
-    return if (tpmSeal(sd, &p, &ce, new)) 0 else 1;
+    return if (resealAny(sd, uid, &p, &ce, new)) 0 else 1;
 }
 
 // secureDir creates dir `path` with `mode` without a shell and fail-closed: mkdir sets
@@ -402,10 +619,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         n += 1;
     }
     const args = argv[0..n];
-    if (args.len < 2) die("usage: sintykey <provision|change-pin|verify-pin|unseal|recover|mkdirs> [flags]");
+    if (args.len < 2) die("usage: sintykey <provision|provision-device|unlock-device|change-pin|verify-pin|unseal|recover|mkdirs> [flags]");
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "mkdirs")) return cmdMkdirs(args);
     if (std.mem.eql(u8, cmd, "provision")) return cmdProvision(args);
+    if (std.mem.eql(u8, cmd, "provision-device")) return cmdProvisionDevice(args);
+    if (std.mem.eql(u8, cmd, "unlock-device")) return cmdUnlockDevice(args);
     if (std.mem.eql(u8, cmd, "change-pin")) return cmdChangePin(args);
     if (std.mem.eql(u8, cmd, "verify-pin")) return cmdVerifyPin(args);
     if (std.mem.eql(u8, cmd, "unseal")) return cmdUnseal(args);
