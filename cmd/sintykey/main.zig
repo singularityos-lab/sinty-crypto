@@ -35,6 +35,10 @@ const O_DIRECTORY: c_int = 0o200000;
 const O_CLOEXEC: c_int = 0o2000000;
 
 const KEYLEN = 32;
+// Without a TPM there is no hardware dictionary-attack lockout, so the software L1 tier
+// must carry the strength in the secret itself: a short PIN is refused there and a real
+// passphrase is required. On the hardware tiers a short PIN stays safe (the TPM throttles).
+const l1_min_secret = 12;
 
 fn die(msg: []const u8) noreturn {
     std.debug.print("sintykey: {s}\n", .{msg});
@@ -245,6 +249,7 @@ fn softSeal(sd: []const u8, name: []const u8, k: *const key.Key, secret: []const
 fn resealAny(sd: []const u8, uid: []const u8, p: *Paths, k: *const key.Key, secret: []const u8) bool {
     if (tpmSeal(sd, p, k, secret)) return true;
     if (bo.enforce_tpm) return false;
+    if (secret.len < l1_min_secret) return false; // L1 needs a real passphrase, not a short PIN
     return softSeal(sd, uid, k, secret);
 }
 
@@ -326,9 +331,11 @@ fn cmdProvision(args: []const [:0]const u8) u8 {
     if (!tpmSeal(sd, &p, &ce, pin)) {
         if (bo.enforce_tpm)
             die("TPM seal failed and enforce_tpm set -- refusing to provision a PIN that cannot unlock");
+        if (pin.len < l1_min_secret)
+            die("no TPM present: without the hardware lockout a short PIN is unsafe -- provide a passphrase of at least 12 characters");
         if (!softSeal(sd, uid, &ce, pin))
             die("both TPM and software seal failed -- cannot secure the PIN");
-        std.debug.print("sintykey: no TPM -- provisioned at software tier (L1)\n", .{});
+        std.debug.print("sintykey: no TPM -- provisioned at software tier (L1, passphrase-protected)\n", .{});
     }
 
     // Recovery wrap: the escape hatch for a forgotten PIN or a cleared TPM.
