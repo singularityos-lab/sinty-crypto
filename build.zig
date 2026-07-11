@@ -24,6 +24,10 @@ pub fn build(b: *std.Build) void {
     // account whose PIN cannot unseal (login dead, only recovery works) yet report
     // success. Dev builds may disable to exercise the recovery-wrap path.
     opts.addOption(bool, "enforce_tpm", b.option(bool, "enforce-tpm", "provision MUST succeed the TPM seal") orelse true);
+    // Optional measured-boot binding: comma-separated SHA-256 PCR indices the sealed keys
+    // are additionally bound to, so unseal requires the boot state to match seal time.
+    // Empty (default) = PIN-only sealing; enable once the boot chain measures into the PCRs.
+    opts.addOption([]const u8, "seal_pcrs", b.option([]const u8, "seal-pcrs", "comma-separated PCR indices to bind sealed keys to") orelse "");
     // E2E-only: logs fscrypt key identifiers + key hashes to /var/lib/sinty/.dbg-*
     // for debugging fscrypt key issues across reboots. NEVER set in a release image.
     opts.addOption(bool, "debug_e2e", b.option(bool, "debug-e2e", "E2E diagnostics to .dbg-* files") orelse false);

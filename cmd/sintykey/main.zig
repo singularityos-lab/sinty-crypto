@@ -19,6 +19,7 @@ extern fn close(fd: c_int) c_int;
 extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern fn unlink(path: [*:0]const u8) c_int;
 extern fn getenv(name: [*:0]const u8) ?[*:0]u8;
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn fork() c_int;
 extern fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 extern fn waitpid(pid: c_int, status: *c_int, options: c_int) c_int;
@@ -617,6 +618,14 @@ fn cmdMkdirs(_: []const [:0]const u8) u8 {
 }
 
 pub fn main(init: std.process.Init.Minimal) u8 {
+    // Pass the measured-boot PCR selection down to sintykey-tpm (inherited across the
+    // fork/exec in runTpm). Empty by default -> PIN-only sealing.
+    if (bo.seal_pcrs.len > 0) {
+        var pbuf: [64]u8 = undefined;
+        if (std.fmt.bufPrintZ(&pbuf, "{s}", .{bo.seal_pcrs})) |z| {
+            _ = setenv("SINTYKEY_SEAL_PCRS", z.ptr, 1);
+        } else |_| {}
+    }
     var it = std.process.Args.Iterator.init(init.args);
     var argv: [32][:0]const u8 = undefined;
     var n: usize = 0;

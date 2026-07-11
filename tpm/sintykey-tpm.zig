@@ -134,6 +134,59 @@ fn authFromPin(pin: []const u8) c.TPM2B_AUTH {
     return a;
 }
 
+// sealPcrs parses SINTYKEY_SEAL_PCRS (comma-separated decimal PCR indices, SHA-256 bank)
+// into a selection. Returns null when unset/empty, which keeps sealing PIN-only (the object
+// is unlocked by the authValue alone). When set, the sealed key additionally requires the
+// listed PCRs to hold their seal-time values, binding it to a measured boot state.
+fn sealPcrs() ?c.TPML_PCR_SELECTION {
+    const env = getenv("SINTYKEY_SEAL_PCRS") orelse return null;
+    const s = std.mem.span(env);
+    if (s.len == 0) return null;
+    var sel = std.mem.zeroes(c.TPML_PCR_SELECTION);
+    sel.count = 1;
+    sel.pcrSelections[0].hash = c.TPM2_ALG_SHA256;
+    sel.pcrSelections[0].sizeofSelect = 3; // 24 PCRs / 8 bits
+    var any = false;
+    var it = std.mem.tokenizeScalar(u8, s, ',');
+    while (it.next()) |tok| {
+        const idx = std.fmt.parseInt(u8, std.mem.trim(u8, tok, " "), 10) catch continue;
+        if (idx >= 24) continue;
+        sel.pcrSelections[0].pcrSelect[idx / 8] |= (@as(u8, 1) << @intCast(idx % 8));
+        any = true;
+    }
+    return if (any) sel else null;
+}
+
+// symNull is the "no parameter encryption" symmetric definition for a bare policy session.
+fn symNull() c.TPMT_SYM_DEF {
+    var s = std.mem.zeroes(c.TPMT_SYM_DEF);
+    s.algorithm = c.TPM2_ALG_NULL;
+    return s;
+}
+
+// runPolicy applies PolicyAuthValue (the PIN must be satisfied) then PolicyPCR (the sealed
+// PCR state must match the current one) to a session. Used both trial (to derive the
+// seal-time authPolicy digest) and real (to authorize an unseal).
+fn runPolicy(ctx: *c.ESYS_CONTEXT, session: c.ESYS_TR, sel: *const c.TPML_PCR_SELECTION) void {
+    ck(c.Esys_PolicyAuthValue(ctx, session, c.ESYS_TR_NONE, c.ESYS_TR_NONE, c.ESYS_TR_NONE), "policy authvalue");
+    ck(c.Esys_PolicyPCR(ctx, session, c.ESYS_TR_NONE, c.ESYS_TR_NONE, c.ESYS_TR_NONE, null, sel), "policy pcr");
+}
+
+// policyDigest runs the policy in a trial session and returns its digest: the authPolicy
+// the sealed object is created under, so only that same PIN+PCR combination can unseal it.
+fn policyDigest(ctx: *c.ESYS_CONTEXT, sel: *const c.TPML_PCR_SELECTION) c.TPM2B_DIGEST {
+    var sym = symNull();
+    var session: c.ESYS_TR = c.ESYS_TR_NONE;
+    ck(c.Esys_StartAuthSession(ctx, c.ESYS_TR_NONE, c.ESYS_TR_NONE, c.ESYS_TR_NONE, c.ESYS_TR_NONE, c.ESYS_TR_NONE, null, c.TPM2_SE_TRIAL, &sym, c.TPM2_ALG_SHA256, &session), "start trial session");
+    defer _ = c.Esys_FlushContext(ctx, session);
+    runPolicy(ctx, session, sel);
+    var digest: ?*c.TPM2B_DIGEST = null;
+    ck(c.Esys_PolicyGetDigest(ctx, session, c.ESYS_TR_NONE, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &digest), "policy getdigest");
+    const d = digest.?.*;
+    c.Esys_Free(digest);
+    return d;
+}
+
 fn doSeal(ctx: *c.ESYS_CONTEXT, keyfile: [:0]const u8, pinfile: [:0]const u8, pubOut: [:0]const u8, privOut: [:0]const u8) void {
     const primary = ensurePrimary(ctx);
     var keybuf: [256]u8 = undefined;
@@ -149,7 +202,14 @@ fn doSeal(ctx: *c.ESYS_CONTEXT, keyfile: [:0]const u8, pinfile: [:0]const u8, pu
     inSensitive.sensitive.data.size = @intCast(keyb.len);
     @memcpy(inSensitive.sensitive.data.buffer[0..keyb.len], keyb);
 
-    const inPublic = sealTemplate();
+    var inPublic = sealTemplate();
+    // When PCRs are configured, seal under a policy (PIN authValue AND the measured PCR
+    // state) instead of the plain authValue: clear USERWITHAUTH so a user-role unseal must
+    // satisfy the authPolicy, and set that policy to the trial digest.
+    if (sealPcrs()) |sel| {
+        inPublic.publicArea.authPolicy = policyDigest(ctx, &sel);
+        inPublic.publicArea.objectAttributes &= ~@as(c.TPMA_OBJECT, c.TPMA_OBJECT_USERWITHAUTH);
+    }
     const outsideInfo = std.mem.zeroes(c.TPM2B_DATA);
     const creationPCR = std.mem.zeroes(c.TPML_PCR_SELECTION);
     var outPrivate: ?*c.TPM2B_PRIVATE = null;
@@ -198,9 +258,29 @@ fn tryUnseal(ctx: *c.ESYS_CONTEXT, pinfile: [:0]const u8, pubIn: [:0]const u8, p
     ck(c.Esys_TR_SetAuth(ctx, item, &auth), "set pin auth");
     std.crypto.secureZero(u8, &pinbuf);
 
+    // A PCR-bound object carries an authPolicy: authorize it with a real policy session
+    // (PolicyAuthValue binds the PIN we just set, PolicyPCR requires the sealed PCR state),
+    // so a wrong PIN OR a changed measured-boot state both fail the unseal. An object with
+    // no authPolicy keeps the plain password-auth path (backward compatible).
+    var authSession: c.ESYS_TR = c.ESYS_TR_PASSWORD;
+    var pcrSession: c.ESYS_TR = c.ESYS_TR_NONE;
+    if (pubBlob.publicArea.authPolicy.size > 0) {
+        if (sealPcrs()) |sel| {
+            var sym = symNull();
+            if (c.Esys_StartAuthSession(ctx, c.ESYS_TR_NONE, c.ESYS_TR_NONE, c.ESYS_TR_NONE, c.ESYS_TR_NONE, c.ESYS_TR_NONE, null, c.TPM2_SE_POLICY, &sym, c.TPM2_ALG_SHA256, &pcrSession) != c.TSS2_RC_SUCCESS)
+                return null;
+            runPolicy(ctx, pcrSession, &sel);
+            authSession = pcrSession;
+        } else return null; // sealed under a policy but no selection configured now
+    }
+    defer if (pcrSession != c.ESYS_TR_NONE) {
+        _ = c.Esys_FlushContext(ctx, pcrSession);
+    };
+
     var outData: ?*c.TPM2B_SENSITIVE_DATA = null;
-    // A wrong PIN fails here (and advances the DA lockout) -> not fatal, just "no".
-    if (c.Esys_Unseal(ctx, item, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &outData) != c.TSS2_RC_SUCCESS)
+    // A wrong PIN (or, for a PCR-bound object, a changed PCR state) fails here and advances
+    // the DA lockout -> not fatal, just "no".
+    if (c.Esys_Unseal(ctx, item, authSession, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &outData) != c.TSS2_RC_SUCCESS)
         return null;
     defer {
         c.Esys_Free(outData);
