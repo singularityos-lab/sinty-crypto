@@ -16,6 +16,7 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn read(fd: c_int, buf: [*]u8, n: usize) isize;
 extern fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
 extern fn close(fd: c_int) c_int;
+extern fn fsync(fd: c_int) c_int;
 extern fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern fn unlink(path: [*:0]const u8) c_int;
 extern fn getenv(name: [*:0]const u8) ?[*:0]u8;
@@ -140,9 +141,23 @@ fn runTpm(argv: [*:null]const ?[*:0]const u8) bool {
 fn writeSecret(path: [*:0]const u8, data: []const u8) bool {
     const fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600);
     if (fd < 0) return false;
-    _ = write(fd, data.ptr, data.len);
-    _ = close(fd);
-    return true;
+    // A single write() may be short, leaving a truncated secret while the caller is told it
+    // succeeded; and without fsync the bytes may never reach disk before a power loss. Loop
+    // the write, fsync, and check close so "true" means the whole secret is durably on disk.
+    var off: usize = 0;
+    while (off < data.len) {
+        const w = write(fd, data[off..].ptr, data.len - off);
+        if (w <= 0) {
+            _ = close(fd);
+            return false;
+        }
+        off += @intCast(w);
+    }
+    if (fsync(fd) != 0) {
+        _ = close(fd);
+        return false;
+    }
+    return close(fd) == 0;
 }
 
 fn readFileAll(path: [*:0]const u8, buf: []u8) ?usize {

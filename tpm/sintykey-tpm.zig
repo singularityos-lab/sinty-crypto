@@ -25,6 +25,7 @@ extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn read(fd: c_int, buf: [*]u8, n: usize) isize;
 extern fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
 extern fn close(fd: c_int) c_int;
+extern fn fsync(fd: c_int) c_int;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 const O_RDONLY: c_int = 0;
@@ -55,8 +56,23 @@ fn readFile(path: [:0]const u8, buf: []u8) []u8 {
 fn writeFileSecret(path: [:0]const u8, bytes: []const u8) void {
     const fd = open(path.ptr, O_WRONLY | O_CREAT | O_TRUNC, 0o600);
     if (fd < 0) fatal("create {s}", .{path});
-    _ = write(fd, bytes.ptr, bytes.len);
-    _ = close(fd);
+    // Loop the write (a single write() may be short and silently truncate the sealed blob),
+    // fsync so it survives power loss, and check close: a truncated .priv/.pub would make the
+    // key unrecoverable while the seal reported success.
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const w = write(fd, bytes[off..].ptr, bytes.len - off);
+        if (w <= 0) {
+            _ = close(fd);
+            fatal("write {s}", .{path});
+        }
+        off += @intCast(w);
+    }
+    if (fsync(fd) != 0) {
+        _ = close(fd);
+        fatal("fsync {s}", .{path});
+    }
+    if (close(fd) != 0) fatal("close {s}", .{path});
 }
 
 fn esysInit() *c.ESYS_CONTEXT {
