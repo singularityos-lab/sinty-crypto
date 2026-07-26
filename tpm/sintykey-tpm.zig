@@ -9,7 +9,11 @@
 //! The TCTI is chosen by the SINTYKEY_TCTI env (e.g. "swtpm:host=127.0.0.1,port=2321"
 //! in a VM); default is the kernel resource manager on hardware. The PIN is read from a
 //! 0600 file, never argv. The sealed object lives under a persistent ECC primary at
-//! 0x81000001, created once in the owner hierarchy.
+//! 0x81000001, created deterministically in the endorsement hierarchy. The endorsement
+//! seed (EPS) is manufacturer-provisioned and stable across reboots and across an owner
+//! clear/owner-seed reset (which some firmware TPMs do), so the primary NAME is identical
+//! every boot and the sealed blob always loads -- the owner hierarchy's seed is not, which
+//! made the FIXEDPARENT blob fail to load after a reboot on real hardware ("bad object").
 const std = @import("std");
 const c = @cImport({
     @cInclude("tss2/tss2_esys.h");
@@ -133,7 +137,7 @@ fn ensurePrimary(ctx: *c.ESYS_CONTEXT) c.ESYS_TR {
     const creationPCR = std.mem.zeroes(c.TPML_PCR_SELECTION);
     var transient: c.ESYS_TR = c.ESYS_TR_NONE;
     var outPublic: ?*c.TPM2B_PUBLIC = null;
-    ck(c.Esys_CreatePrimary(ctx, c.ESYS_TR_RH_OWNER, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &inSensitive, &inPublic, &outsideInfo, &creationPCR, &transient, &outPublic, null, null, null), "createprimary");
+    ck(c.Esys_CreatePrimary(ctx, c.ESYS_TR_RH_ENDORSEMENT, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &inSensitive, &inPublic, &outsideInfo, &creationPCR, &transient, &outPublic, null, null, null), "createprimary");
     c.Esys_Free(outPublic);
     // Persist it at 0x81000001, then drop the transient copy.
     var persistent: c.ESYS_TR = c.ESYS_TR_NONE;
@@ -307,6 +311,182 @@ fn tryUnseal(ctx: *c.ESYS_CONTEXT, pinfile: [:0]const u8, pubIn: [:0]const u8, p
     return out[0..n];
 }
 
+// ---- bootloader lock bit (hardware-anchored, TPM NV) ----
+//
+// The lock/unlock state lives in a TPM NV index, not an ESP file: an ESP file is
+// forgeable offline, an NV index is anchored in the TPM and (on hardware) written
+// only under owner authorization. Two indices:
+//   SINTY_NV_LOCK  (0x01800001, ordinary, 16 bytes) holds the magic + state byte +
+//                  a software unlock counter.
+//   SINTY_NV_COUNT (0x01800002, TPM2_NT_COUNTER) is the hardware-monotonic anchor,
+//                  bumped on every state transition so the ordinary index cannot be
+//                  silently rolled back to an older (e.g. still-unlocked) snapshot.
+//
+// Reads FAIL CLOSED: an undefined index, a read error, a wrong magic, or any state
+// byte other than UNLOCKED reports LOCKED. A missing/failed TPM never reads as
+// "unlocked".
+// SINTY_NV_VERITY (0x01800003, ordinary, 1 byte) is the dm-verity policy toggle the
+// loader consumes: value VERITY_OFF (0xA5) means "boot with verity OFF" (the loader omits
+// ATOM_ROOT_HASH, mounting the rootfs on its existing no-hash path); ANY other value, an
+// undefined index, or a read failure means verity ON (fail closed -> verified boot stays on).
+// It is a separate index from the lock bit so the recovery flow can drive the wipe, the
+// unlock bit, and the verity toggle as independent steps.
+const SINTY_NV_LOCK: u32 = 0x01800001;
+const SINTY_NV_COUNT: u32 = 0x01800002;
+const SINTY_NV_VERITY: u32 = 0x01800003;
+const LOCK_MAGIC = [4]u8{ 'S', 'K', 'L', 'K' };
+const STATE_UNLOCKED: u8 = 0xA5;
+const STATE_LOCKED: u8 = 0x00;
+const VERITY_OFF: u8 = 0xA5;
+const VERITY_ON: u8 = 0x00;
+const LOCK_DATA_SIZE: u16 = 16;
+
+fn nvExisting(ctx: *c.ESYS_CONTEXT, index: u32) ?c.ESYS_TR {
+    var h: c.ESYS_TR = c.ESYS_TR_NONE;
+    if (c.Esys_TR_FromTPMPublic(ctx, index, c.ESYS_TR_NONE, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &h) == c.TSS2_RC_SUCCESS)
+        return h;
+    return null;
+}
+
+// nvEnsure returns the handle for `index`, defining it in the owner hierarchy on first
+// use. Owner-auth read/write; NO_DA so a lock read never trips the DA lockout. The
+// counter index additionally carries TPM2_NT_COUNTER (8-octet monotonic, increment-only).
+fn nvEnsure(ctx: *c.ESYS_CONTEXT, index: u32, size: u16, is_counter: bool) c.ESYS_TR {
+    if (nvExisting(ctx, index)) |h| return h;
+    var nvpub = std.mem.zeroes(c.TPM2B_NV_PUBLIC);
+    nvpub.nvPublic.nvIndex = index;
+    nvpub.nvPublic.nameAlg = c.TPM2_ALG_SHA256;
+    var attr: c.TPMA_NV = c.TPMA_NV_OWNERWRITE | c.TPMA_NV_OWNERREAD |
+        c.TPMA_NV_AUTHWRITE | c.TPMA_NV_AUTHREAD | c.TPMA_NV_NO_DA;
+    if (is_counter) attr |= @as(c.TPMA_NV, c.TPM2_NT_COUNTER) << c.TPMA_NV_TPM2_NT_SHIFT;
+    nvpub.nvPublic.attributes = attr;
+    nvpub.nvPublic.dataSize = size;
+    const auth = std.mem.zeroes(c.TPM2B_AUTH);
+    var h: c.ESYS_TR = c.ESYS_TR_NONE;
+    ck(c.Esys_NV_DefineSpace(ctx, c.ESYS_TR_RH_OWNER, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &auth, &nvpub, &h), "nv definespace");
+    return h;
+}
+
+fn nvWrite(ctx: *c.ESYS_CONTEXT, h: c.ESYS_TR, data: []const u8) void {
+    var buf = std.mem.zeroes(c.TPM2B_MAX_NV_BUFFER);
+    buf.size = @intCast(data.len);
+    @memcpy(buf.buffer[0..data.len], data);
+    ck(c.Esys_NV_Write(ctx, c.ESYS_TR_RH_OWNER, h, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &buf, 0), "nv write");
+}
+
+// nvReadLock reads the 16-byte lock record. Returns null on any anomaly so the caller
+// treats it as LOCKED (fail closed).
+fn nvReadLock(ctx: *c.ESYS_CONTEXT) ?[LOCK_DATA_SIZE]u8 {
+    const h = nvExisting(ctx, SINTY_NV_LOCK) orelse return null;
+    var data: ?*c.TPM2B_MAX_NV_BUFFER = null;
+    if (c.Esys_NV_Read(ctx, c.ESYS_TR_RH_OWNER, h, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE, LOCK_DATA_SIZE, 0, &data) != c.TSS2_RC_SUCCESS)
+        return null;
+    defer c.Esys_Free(data);
+    if (data.?.size < LOCK_DATA_SIZE) return null;
+    var out: [LOCK_DATA_SIZE]u8 = undefined;
+    @memcpy(&out, data.?.buffer[0..LOCK_DATA_SIZE]);
+    return out;
+}
+
+// nvReadCounter returns the hardware-monotonic anchor. TPM NV counters are big-endian;
+// an uninitialized/absent counter reads as 0 (still fail-closed: it is only informative).
+fn nvReadCounter(ctx: *c.ESYS_CONTEXT) u64 {
+    const h = nvExisting(ctx, SINTY_NV_COUNT) orelse return 0;
+    var data: ?*c.TPM2B_MAX_NV_BUFFER = null;
+    if (c.Esys_NV_Read(ctx, c.ESYS_TR_RH_OWNER, h, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE, 8, 0, &data) != c.TSS2_RC_SUCCESS)
+        return 0;
+    defer c.Esys_Free(data);
+    if (data.?.size < 8) return 0;
+    return std.mem.readInt(u64, data.?.buffer[0..8], .big);
+}
+
+fn nvBumpCounter(ctx: *c.ESYS_CONTEXT) void {
+    const h = nvEnsure(ctx, SINTY_NV_COUNT, 8, true);
+    ck(c.Esys_NV_Increment(ctx, c.ESYS_TR_RH_OWNER, h, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE), "nv increment");
+}
+
+// isUnlocked decodes a lock record fail-closed: the magic must match AND the state byte
+// must be exactly STATE_UNLOCKED. Anything else is LOCKED.
+fn isUnlocked(rec: [LOCK_DATA_SIZE]u8) bool {
+    if (!std.mem.eql(u8, rec[0..4], &LOCK_MAGIC)) return false;
+    return rec[4] == STATE_UNLOCKED;
+}
+
+fn unlockCount(rec: [LOCK_DATA_SIZE]u8) u64 {
+    return std.mem.readInt(u64, rec[8..16], .little);
+}
+
+// lockReport writes the machine- and human-readable state line to stdout. Fail closed:
+// any read failure yields "state=locked unlocks=0 hwcounter=0". Always exits 0 so the
+// caller (recovery / loader) reliably gets a definitive locked answer, never a crash it
+// might misread as "no policy, allow".
+fn lockReport(ctx: *c.ESYS_CONTEXT) u8 {
+    var unlocked = false;
+    var unlocks: u64 = 0;
+    if (nvReadLock(ctx)) |rec| {
+        unlocked = isUnlocked(rec);
+        unlocks = unlockCount(rec);
+    }
+    const hw = nvReadCounter(ctx);
+    var lb: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(&lb, "state={s} unlocks={d} hwcounter={d}\n", .{ if (unlocked) "unlocked" else "locked", unlocks, hw }) catch return 0;
+    _ = write(1, line.ptr, line.len);
+    return 0;
+}
+
+// writeLockState writes a fresh lock record with the given state and unlock count, then
+// bumps the hardware counter so the ordinary index cannot be rolled back undetected.
+fn writeLockState(ctx: *c.ESYS_CONTEXT, state: u8, count: u64) void {
+    const h = nvEnsure(ctx, SINTY_NV_LOCK, LOCK_DATA_SIZE, false);
+    var rec = std.mem.zeroes([LOCK_DATA_SIZE]u8);
+    @memcpy(rec[0..4], &LOCK_MAGIC);
+    rec[4] = state;
+    std.mem.writeInt(u64, rec[8..16], count, .little);
+    nvWrite(ctx, h, &rec);
+    nvBumpCounter(ctx);
+}
+
+// lockUnlock sets the bootloader UNLOCKED and increments the persisted unlock count.
+fn lockUnlock(ctx: *c.ESYS_CONTEXT) u8 {
+    var count: u64 = 0;
+    if (nvReadLock(ctx)) |rec| count = unlockCount(rec);
+    writeLockState(ctx, STATE_UNLOCKED, count + 1);
+    return 0;
+}
+
+// lockRelock sets the bootloader LOCKED. The unlock count is monotonic (kept, never
+// reset); the hardware counter still bumps to anchor the transition.
+fn lockRelock(ctx: *c.ESYS_CONTEXT) u8 {
+    var count: u64 = 0;
+    if (nvReadLock(ctx)) |rec| count = unlockCount(rec);
+    writeLockState(ctx, STATE_LOCKED, count);
+    return 0;
+}
+
+// verityIsOff reads the verity toggle fail-closed: only an exact VERITY_OFF byte reports
+// off; an undefined index or any read failure reports on (verified boot).
+fn verityIsOff(ctx: *c.ESYS_CONTEXT) bool {
+    const h = nvExisting(ctx, SINTY_NV_VERITY) orelse return false;
+    var data: ?*c.TPM2B_MAX_NV_BUFFER = null;
+    if (c.Esys_NV_Read(ctx, c.ESYS_TR_RH_OWNER, h, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE, 1, 0, &data) != c.TSS2_RC_SUCCESS)
+        return false;
+    defer c.Esys_Free(data);
+    if (data.?.size < 1) return false;
+    return data.?.buffer[0] == VERITY_OFF;
+}
+
+fn verityWrite(ctx: *c.ESYS_CONTEXT, value: u8) void {
+    const h = nvEnsure(ctx, SINTY_NV_VERITY, 1, false);
+    nvWrite(ctx, h, &[_]u8{value});
+}
+
+// verityReport prints the loader-consumable toggle line to stdout, fail closed.
+fn verityReport(ctx: *c.ESYS_CONTEXT) u8 {
+    const line: []const u8 = if (verityIsOff(ctx)) "verity=off\n" else "verity=on\n";
+    _ = write(1, line.ptr, line.len);
+    return 0;
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     var it = std.process.Args.Iterator.init(init.args);
     var argv: [8][:0]const u8 = undefined;
@@ -316,7 +496,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         argv[argc] = a;
         argc += 1;
     }
-    if (argc < 2) fatal("usage: sintykey-tpm ensure-primary|seal|unseal|verify ...", .{});
+    if (argc < 2) fatal("usage: sintykey-tpm ensure-primary|seal|unseal|verify|lock-read|lock-unlock|lock-relock|verity-read|verity-set-off|verity-set-on ...", .{});
     const cmd = argv[1];
     const ctx = esysInit(); // one-shot CLI: the process exits right after, so the OS reclaims the ESYS ctx
 
@@ -337,6 +517,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const ok = tryUnseal(ctx, argv[2], argv[3], argv[4], &out) != null;
         std.crypto.secureZero(u8, &out);
         return if (ok) 0 else 1;
+    } else if (std.mem.eql(u8, cmd, "lock-read")) {
+        return lockReport(ctx);
+    } else if (std.mem.eql(u8, cmd, "lock-unlock")) {
+        return lockUnlock(ctx);
+    } else if (std.mem.eql(u8, cmd, "lock-relock")) {
+        return lockRelock(ctx);
+    } else if (std.mem.eql(u8, cmd, "verity-read")) {
+        return verityReport(ctx);
+    } else if (std.mem.eql(u8, cmd, "verity-set-off")) {
+        verityWrite(ctx, VERITY_OFF);
+    } else if (std.mem.eql(u8, cmd, "verity-set-on")) {
+        verityWrite(ctx, VERITY_ON);
     } else {
         fatal("unknown command: {s}", .{cmd});
     }

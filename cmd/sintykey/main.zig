@@ -9,6 +9,7 @@ const bo = @import("build_options");
 const c = @cImport({
     @cInclude("linux/fscrypt.h");
     @cInclude("sys/ioctl.h");
+    @cInclude("dirent.h");
 });
 
 // Raw libc (linked): robust against the churny std.fs/posix API in this Zig.
@@ -103,6 +104,14 @@ fn argFlag(args: []const [:0]const u8, name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, args[i], name)) return args[i + 1];
     }
     return null;
+}
+
+fn hasFlag(args: []const [:0]const u8, name: []const u8) bool {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], name)) return true;
+    }
+    return false;
 }
 
 fn readStdin(buf: []u8) []u8 {
@@ -632,6 +641,175 @@ fn cmdMkdirs(_: []const [:0]const u8) u8 {
     return 0;
 }
 
+extern fn pipe(fds: *[2]c_int) c_int;
+extern fn dup2(oldfd: c_int, newfd: c_int) c_int;
+
+// runTpmCapture execs sintykey-tpm and captures its stdout into `out`, returning the
+// captured slice (empty on failure). Used for lock-read, whose one-line state output the
+// wrapper parses. Secrets never travel this path (lock state is not a secret).
+fn runTpmCapture(argv: [*:null]const ?[*:0]const u8, out: []u8, ok: *bool) []u8 {
+    ok.* = false;
+    var fds: [2]c_int = undefined;
+    if (pipe(&fds) != 0) return out[0..0];
+    const pid = fork();
+    if (pid < 0) {
+        _ = close(fds[0]);
+        _ = close(fds[1]);
+        return out[0..0];
+    }
+    if (pid == 0) {
+        _ = close(fds[0]);
+        _ = dup2(fds[1], 1);
+        _ = close(fds[1]);
+        _ = execvp(argv[0].?, argv);
+        _exit(127);
+    }
+    _ = close(fds[1]);
+    var n: usize = 0;
+    while (n < out.len) {
+        const r = read(fds[0], out[n..].ptr, out.len - n);
+        if (r <= 0) break;
+        n += @intCast(r);
+    }
+    _ = close(fds[0]);
+    var status: c_int = 0;
+    _ = waitpid(pid, &status, 0);
+    ok.* = (status & 0x7f) == 0 and ((status >> 8) & 0xff) == 0;
+    return out[0..n];
+}
+
+// wipeKeys is the evil-maid wipe: it discards ALL fscrypt key custody so /var (DE) and
+// every home (CE) become permanently unreadable. It deletes the TPM-sealed blobs, the
+// software L1 blobs, the device key, and the recovery blobs from state_dir; with the key
+// material gone no tier can ever re-derive a CE/DE key, so the ciphertext is cryptographically
+// destroyed. Kernel-resident keys drop at the mandatory reboot the (un)lock triggers.
+// Returns the number of artifacts removed.
+fn wipeKeys() usize {
+    const sd = stateDir();
+    var sdz: [512]u8 = undefined;
+    const sdZ = std.fmt.bufPrintZ(&sdz, "{s}", .{sd}) catch return 0;
+    const dir = c.opendir(sdZ.ptr) orelse return 0;
+    defer _ = c.closedir(dir);
+    const suffixes = [_][]const u8{ ".priv", ".pub", ".soft", ".recovery", ".key" };
+    var removed: usize = 0;
+    while (c.readdir(dir)) |ent| {
+        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.*.d_name)), 0);
+        var match = false;
+        for (suffixes) |sfx| {
+            if (std.mem.endsWith(u8, name, sfx)) match = true;
+        }
+        if (!match) continue;
+        var pb: [1024]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&pb, "{s}/{s}", .{ sd, name }) catch continue;
+        if (unlink(path.ptr) == 0) removed += 1;
+    }
+    return removed;
+}
+
+// lock-state: read the hardware lock bit and print it in the recovery seam's format:
+//   locked=<true|false>
+//   unlock_count=<int>
+// FAIL CLOSED: if the TPM helper cannot reach the TPM (nonzero exit) we print locked=true
+// and EXIT NONZERO (2), so a missing/failed TPM is never mistaken for unlocked. A reachable
+// TPM with the index undefined is a legitimate LOCKED (exit 0). The recovery agent
+// (cryptoReadLockBit) parses these two lines.
+fn cmdLockState(_: []const [:0]const u8) u8 {
+    var buf: [256]u8 = undefined;
+    var ok: bool = false;
+    const outp = runTpmCapture(&.{ tpmBin(), "lock-read", null }, &buf, &ok);
+    if (!ok) {
+        _ = write(1, "locked=true\nunlock_count=0\n", 27);
+        return 2;
+    }
+    const unlocked = std.mem.indexOf(u8, outp, "state=unlocked") != null;
+    var count: []const u8 = "0";
+    if (std.mem.indexOf(u8, outp, "unlocks=")) |i| {
+        const rest = outp[i + "unlocks=".len ..];
+        const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+        if (end > 0) count = rest[0..end];
+    }
+    var lb: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(&lb, "locked={s}\nunlock_count={s}\n", .{ if (unlocked) "false" else "true", count }) catch {
+        _ = write(1, "locked=true\nunlock_count=0\n", 27);
+        return 2;
+    };
+    _ = write(1, line.ptr, line.len);
+    return 0;
+}
+
+// verity-state: print the dm-verity policy the loader must apply, straight from the TPM NV
+// verity toggle (verity=on|off). Fail closed to verity=on. This is the loader's read seam.
+fn cmdVerityState(_: []const [:0]const u8) u8 {
+    var buf: [64]u8 = undefined;
+    var ok: bool = false;
+    const outp = runTpmCapture(&.{ tpmBin(), "verity-read", null }, &buf, &ok);
+    const off = ok and std.mem.indexOf(u8, outp, "verity=off") != null;
+    const line: []const u8 = if (off) "verity=off\n" else "verity=on\n";
+    _ = write(1, line.ptr, line.len);
+    return 0;
+}
+
+// wipe-var (cryptoWipeVar): the evil-maid wipe. Discards ALL CE/DE fscrypt key custody so
+// /var and every home become permanently unreadable. Exit 0 on success.
+fn cmdWipeVar(_: []const [:0]const u8) u8 {
+    const n = wipeKeys();
+    std.debug.print("sintykey: wiped {d} key artifact(s)\n", .{n});
+    return 0;
+}
+
+// set-unlock (cryptoSetUnlockBit): flip the TPM NV lock bit to UNLOCKED and advance the
+// monotonic unlock count. Exit 0 on success, nonzero if the TPM write failed.
+fn cmdSetUnlock(_: []const [:0]const u8) u8 {
+    if (!runTpm(&.{ tpmBin(), "lock-unlock", null })) return 1;
+    return 0;
+}
+
+// set-lock: clear the TPM NV lock bit back to LOCKED (unlock count is monotonic, kept).
+// The mirror of set-unlock, for the re-lock flow.
+fn cmdSetLock(_: []const [:0]const u8) u8 {
+    if (!runTpm(&.{ tpmBin(), "lock-relock", null })) return 1;
+    return 0;
+}
+
+// disable-verity (cryptoDisableVerity): set the TPM NV verity toggle to OFF so the loader
+// boots on its no-ATOM_ROOT_HASH path. The loader consumes the toggle by reading TPM NV
+// index 0x01800003 (value 0xA5 == off), or via `sintykey verity-state`. Exit 0 on success.
+fn cmdDisableVerity(_: []const [:0]const u8) u8 {
+    if (!runTpm(&.{ tpmBin(), "verity-set-off", null })) return 1;
+    return 0;
+}
+
+// enable-verity: set the verity toggle back ON (verified boot). Mirror of disable-verity.
+fn cmdEnableVerity(_: []const [:0]const u8) u8 {
+    if (!runTpm(&.{ tpmBin(), "verity-set-on", null })) return 1;
+    return 0;
+}
+
+// unlock-bootloader --confirm: convenience wrapper that runs the whole unlock the recovery
+// agent otherwise orchestrates step by step: wipe -> set-unlock -> disable-verity. Requires
+// --confirm so the destructive wipe is never a single accidental invocation.
+fn cmdUnlockBootloader(args: []const [:0]const u8) u8 {
+    if (!hasFlag(args, "--confirm")) die("unlock-bootloader wipes ALL data -- re-run with --confirm");
+    const n = wipeKeys();
+    std.debug.print("sintykey: wiped {d} key artifact(s)\n", .{n});
+    if (!runTpm(&.{ tpmBin(), "lock-unlock", null })) die("TPM lock bit set-unlocked failed");
+    if (!runTpm(&.{ tpmBin(), "verity-set-off", null })) die("TPM verity toggle set-off failed");
+    std.debug.print("sintykey: bootloader UNLOCKED (verity off at next boot)\n", .{});
+    return 0;
+}
+
+// lock-bootloader --confirm: convenience wrapper for the re-lock: wipe -> set-lock ->
+// enable-verity. Same --confirm gate.
+fn cmdLockBootloader(args: []const [:0]const u8) u8 {
+    if (!hasFlag(args, "--confirm")) die("lock-bootloader wipes ALL data -- re-run with --confirm");
+    const n = wipeKeys();
+    std.debug.print("sintykey: wiped {d} key artifact(s)\n", .{n});
+    if (!runTpm(&.{ tpmBin(), "lock-relock", null })) die("TPM lock bit set-locked failed");
+    if (!runTpm(&.{ tpmBin(), "verity-set-on", null })) die("TPM verity toggle set-on failed");
+    std.debug.print("sintykey: bootloader LOCKED (verity on at next boot)\n", .{});
+    return 0;
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     // Pass the measured-boot PCR selection down to sintykey-tpm (inherited across the
     // fork/exec in runTpm). Empty by default -> PIN-only sealing.
@@ -650,9 +828,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         n += 1;
     }
     const args = argv[0..n];
-    if (args.len < 2) die("usage: sintykey <provision|provision-device|unlock-device|change-pin|verify-pin|unseal|recover|mkdirs> [flags]");
+    if (args.len < 2) die("usage: sintykey <provision|provision-device|unlock-device|change-pin|verify-pin|unseal|recover|mkdirs|lock-state|verity-state|wipe-var|set-unlock|set-lock|disable-verity|enable-verity|unlock-bootloader|lock-bootloader> [flags]");
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "mkdirs")) return cmdMkdirs(args);
+    if (std.mem.eql(u8, cmd, "lock-state")) return cmdLockState(args);
+    if (std.mem.eql(u8, cmd, "verity-state")) return cmdVerityState(args);
+    if (std.mem.eql(u8, cmd, "wipe-var")) return cmdWipeVar(args);
+    if (std.mem.eql(u8, cmd, "set-unlock")) return cmdSetUnlock(args);
+    if (std.mem.eql(u8, cmd, "set-lock")) return cmdSetLock(args);
+    if (std.mem.eql(u8, cmd, "disable-verity")) return cmdDisableVerity(args);
+    if (std.mem.eql(u8, cmd, "enable-verity")) return cmdEnableVerity(args);
+    if (std.mem.eql(u8, cmd, "unlock-bootloader")) return cmdUnlockBootloader(args);
+    if (std.mem.eql(u8, cmd, "lock-bootloader")) return cmdLockBootloader(args);
     if (std.mem.eql(u8, cmd, "provision")) return cmdProvision(args);
     if (std.mem.eql(u8, cmd, "provision-device")) return cmdProvisionDevice(args);
     if (std.mem.eql(u8, cmd, "unlock-device")) return cmdUnlockDevice(args);
