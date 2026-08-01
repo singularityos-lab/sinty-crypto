@@ -25,6 +25,7 @@ extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_
 extern fn fork() c_int;
 extern fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 extern fn waitpid(pid: c_int, status: *c_int, options: c_int) c_int;
+extern fn getpid() c_int;
 extern fn _exit(code: c_int) noreturn;
 const O_RDONLY: c_int = 0;
 const O_APPEND: c_int = 0o2000;
@@ -148,8 +149,12 @@ fn runTpm(argv: [*:null]const ?[*:0]const u8) bool {
 }
 
 fn writeSecret(path: [*:0]const u8, data: []const u8) bool {
-    const fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o600);
+    const fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0o600);
     if (fd < 0) return false;
+    if (fchmod(fd, 0o600) != 0) {
+        _ = close(fd);
+        return false;
+    }
     // A single write() may be short, leaving a truncated secret while the caller is told it
     // succeeded; and without fsync the bytes may never reach disk before a power loss. Loop
     // the write, fsync, and check close so "true" means the whole secret is durably on disk.
@@ -170,7 +175,7 @@ fn writeSecret(path: [*:0]const u8, data: []const u8) bool {
 }
 
 fn readFileAll(path: [*:0]const u8, buf: []u8) ?usize {
-    const fd = open(path, O_RDONLY, 0);
+    const fd = open(path, O_RDONLY | O_NOFOLLOW, 0);
     if (fd < 0) return null;
     defer _ = close(fd);
     var n: usize = 0;
@@ -194,7 +199,7 @@ const Paths = struct {
         // persistent sealed blobs stay on state_dir; the transient plaintext PIN goes to tmpfs scratch
         self.pubZ = std.fmt.bufPrintZ(&self.pub_b, "{s}/{s}.pub", .{ sd, uid }) catch die("path too long");
         self.privZ = std.fmt.bufPrintZ(&self.priv_b, "{s}/{s}.priv", .{ sd, uid }) catch die("path too long");
-        self.pinZ = std.fmt.bufPrintZ(&self.pin_b, "{s}/.pin.{s}", .{ scratchDir(), uid }) catch die("path too long");
+        self.pinZ = std.fmt.bufPrintZ(&self.pin_b, "{s}/.pin.{s}.{d}", .{ scratchDir(), uid, getpid() }) catch die("path too long");
     }
 };
 
@@ -203,7 +208,7 @@ const Paths = struct {
 fn tpmSeal(sd: []const u8, p: *Paths, ce: *const key.Key, pin: []const u8) bool {
     _ = sd; // sealed blobs come from p (state_dir); transient key/pin now live on tmpfs scratch
     var kb: [512]u8 = undefined;
-    const keyf = std.fmt.bufPrintZ(&kb, "{s}/.k.tmp", .{scratchDir()}) catch die("path too long");
+    const keyf = std.fmt.bufPrintZ(&kb, "{s}/.k.{d}.tmp", .{ scratchDir(), getpid() }) catch die("path too long");
     if (!writeSecret(keyf, ce.bytes[0..])) return false;
     defer _ = unlink(keyf.ptr);
     if (!writeSecret(p.pinZ.ptr, pin)) return false;
@@ -284,7 +289,7 @@ fn unsealAny(sd: []const u8, uid: []const u8, p: *Paths, secret: []const u8, k: 
     if (!writeSecret(p.pinZ.ptr, secret)) return false;
     defer _ = unlink(p.pinZ.ptr);
     var ob: [512]u8 = undefined;
-    const outf = std.fmt.bufPrintZ(&ob, "{s}/.out.{s}", .{ scratchDir(), uid }) catch return false;
+    const outf = std.fmt.bufPrintZ(&ob, "{s}/.out.{s}.{d}", .{ scratchDir(), uid, getpid() }) catch return false;
     if (runTpm(&.{ tpmBin(), "unseal", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, outf.ptr, null })) {
         const n = readFileAll(outf.ptr, k.bytes[0..]);
         _ = unlink(outf.ptr);
@@ -412,7 +417,7 @@ fn cmdUnseal(args: []const [:0]const u8) u8 {
     if (!writeSecret(p.pinZ.ptr, pin)) return 1;
     defer _ = unlink(p.pinZ.ptr);
     var ob: [512]u8 = undefined;
-    const outf = std.fmt.bufPrintZ(&ob, "{s}/.out.{s}", .{ scratchDir(), uid }) catch die("path too long");
+    const outf = std.fmt.bufPrintZ(&ob, "{s}/.out.{s}.{d}", .{ scratchDir(), uid, getpid() }) catch die("path too long");
     defer _ = unlink(outf.ptr);
     if (runTpm(&.{ tpmBin(), "unseal", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, outf.ptr, null })) {
         var k: [KEYLEN]u8 = undefined;
@@ -546,11 +551,13 @@ fn cmdUnlockDevice(args: []const [:0]const u8) u8 {
     defer std.crypto.secureZero(u8, de.bytes[0..]);
     var priv_b: [512]u8 = undefined;
     const privZ = std.fmt.bufPrintZ(&priv_b, "{s}/device.priv", .{sd}) catch die("path too long");
-    if (open(privZ.ptr, O_RDONLY, 0) >= 0) {
+    const privfd = open(privZ.ptr, O_RDONLY | O_NOFOLLOW, 0);
+    if (privfd >= 0) {
+        _ = close(privfd);
         var p: Paths = .{};
         p.init(sd, "device");
         var ob: [512]u8 = undefined;
-        const outf = std.fmt.bufPrintZ(&ob, "{s}/.out.device", .{scratchDir()}) catch die("path too long");
+        const outf = std.fmt.bufPrintZ(&ob, "{s}/.out.device.{d}", .{ scratchDir(), getpid() }) catch die("path too long");
         defer _ = unlink(outf.ptr);
         _ = writeSecret(p.pinZ.ptr, "");
         defer _ = unlink(p.pinZ.ptr);
@@ -683,12 +690,13 @@ fn runTpmCapture(argv: [*:null]const ?[*:0]const u8, out: []u8, ok: *bool) []u8 
 // software L1 blobs, the device key, and the recovery blobs from state_dir; with the key
 // material gone no tier can ever re-derive a CE/DE key, so the ciphertext is cryptographically
 // destroyed. Kernel-resident keys drop at the mandatory reboot the (un)lock triggers.
-// Returns the number of artifacts removed.
-fn wipeKeys() usize {
+// Returns the number of artifacts removed, or null if any part of the durable
+// deletion failed. Zero is a valid idempotent retry after an earlier wipe.
+fn wipeKeys() ?usize {
     const sd = stateDir();
     var sdz: [512]u8 = undefined;
-    const sdZ = std.fmt.bufPrintZ(&sdz, "{s}", .{sd}) catch return 0;
-    const dir = c.opendir(sdZ.ptr) orelse return 0;
+    const sdZ = std.fmt.bufPrintZ(&sdz, "{s}", .{sd}) catch return null;
+    const dir = c.opendir(sdZ.ptr) orelse return null;
     defer _ = c.closedir(dir);
     const suffixes = [_][]const u8{ ".priv", ".pub", ".soft", ".recovery", ".key" };
     var removed: usize = 0;
@@ -700,9 +708,12 @@ fn wipeKeys() usize {
         }
         if (!match) continue;
         var pb: [1024]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&pb, "{s}/{s}", .{ sd, name }) catch continue;
-        if (unlink(path.ptr) == 0) removed += 1;
+        const path = std.fmt.bufPrintZ(&pb, "{s}/{s}", .{ sd, name }) catch return null;
+        if (unlink(path.ptr) != 0) return null;
+        removed += 1;
     }
+    const dir_fd = c.dirfd(dir);
+    if (dir_fd < 0 or fsync(dir_fd) != 0) return null;
     return removed;
 }
 
@@ -749,10 +760,10 @@ fn cmdVerityState(_: []const [:0]const u8) u8 {
     return 0;
 }
 
-// wipe-var (cryptoWipeVar): the evil-maid wipe. Discards ALL CE/DE fscrypt key custody so
-// /var and every home become permanently unreadable. Exit 0 on success.
+// wipe-var (cryptoWipeVar): discard all CE/DE fscrypt key custody. The recovery
+// agent removes the remaining persistent files around this cryptographic step.
 fn cmdWipeVar(_: []const [:0]const u8) u8 {
-    const n = wipeKeys();
+    const n = wipeKeys() orelse die("key-custody wipe failed");
     std.debug.print("sintykey: wiped {d} key artifact(s)\n", .{n});
     return 0;
 }
@@ -786,14 +797,14 @@ fn cmdEnableVerity(_: []const [:0]const u8) u8 {
 }
 
 // unlock-bootloader --confirm: convenience wrapper that runs the whole unlock the recovery
-// agent otherwise orchestrates step by step: wipe -> set-unlock -> disable-verity. Requires
+// agent otherwise orchestrates step by step: wipe -> disable-verity -> set-unlock. Requires
 // --confirm so the destructive wipe is never a single accidental invocation.
 fn cmdUnlockBootloader(args: []const [:0]const u8) u8 {
     if (!hasFlag(args, "--confirm")) die("unlock-bootloader wipes ALL data -- re-run with --confirm");
-    const n = wipeKeys();
+    const n = wipeKeys() orelse die("key-custody wipe failed");
     std.debug.print("sintykey: wiped {d} key artifact(s)\n", .{n});
-    if (!runTpm(&.{ tpmBin(), "lock-unlock", null })) die("TPM lock bit set-unlocked failed");
     if (!runTpm(&.{ tpmBin(), "verity-set-off", null })) die("TPM verity toggle set-off failed");
+    if (!runTpm(&.{ tpmBin(), "lock-unlock", null })) die("TPM lock bit set-unlocked failed");
     std.debug.print("sintykey: bootloader UNLOCKED (verity off at next boot)\n", .{});
     return 0;
 }
@@ -802,7 +813,7 @@ fn cmdUnlockBootloader(args: []const [:0]const u8) u8 {
 // enable-verity. Same --confirm gate.
 fn cmdLockBootloader(args: []const [:0]const u8) u8 {
     if (!hasFlag(args, "--confirm")) die("lock-bootloader wipes ALL data -- re-run with --confirm");
-    const n = wipeKeys();
+    const n = wipeKeys() orelse die("key-custody wipe failed");
     std.debug.print("sintykey: wiped {d} key artifact(s)\n", .{n});
     if (!runTpm(&.{ tpmBin(), "lock-relock", null })) die("TPM lock bit set-locked failed");
     if (!runTpm(&.{ tpmBin(), "verity-set-on", null })) die("TPM verity toggle set-on failed");

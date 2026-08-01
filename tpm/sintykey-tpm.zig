@@ -434,16 +434,23 @@ fn lockReport(ctx: *c.ESYS_CONTEXT) u8 {
     return 0;
 }
 
-// writeLockState writes a fresh lock record with the given state and unlock count, then
-// bumps the hardware counter so the ordinary index cannot be rolled back undetected.
+// writeLockState writes a fresh lock record and advances the hardware counter. For
+// unlock, the counter moves first: a counter failure leaves the lock bit untouched,
+// while a later record-write failure leaves the device locked. Relock writes the safe
+// locked state first, then advances the counter.
 fn writeLockState(ctx: *c.ESYS_CONTEXT, state: u8, count: u64) void {
     const h = nvEnsure(ctx, SINTY_NV_LOCK, LOCK_DATA_SIZE, false);
     var rec = std.mem.zeroes([LOCK_DATA_SIZE]u8);
     @memcpy(rec[0..4], &LOCK_MAGIC);
     rec[4] = state;
     std.mem.writeInt(u64, rec[8..16], count, .little);
-    nvWrite(ctx, h, &rec);
-    nvBumpCounter(ctx);
+    if (state == STATE_UNLOCKED) {
+        nvBumpCounter(ctx);
+        nvWrite(ctx, h, &rec);
+    } else {
+        nvWrite(ctx, h, &rec);
+        nvBumpCounter(ctx);
+    }
 }
 
 // lockUnlock sets the bootloader UNLOCKED and increments the persisted unlock count.
