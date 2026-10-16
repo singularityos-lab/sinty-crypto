@@ -804,8 +804,16 @@ fn cmdEnableVerity(_: []const [:0]const u8) u8 {
 // unlock-bootloader --confirm: convenience wrapper that runs the whole unlock the recovery
 // agent otherwise orchestrates step by step: wipe -> disable-verity -> set-unlock. Requires
 // --confirm so the destructive wipe is never a single accidental invocation.
+fn tpmReachable() bool {
+    var buf: [256]u8 = undefined;
+    var ok: bool = false;
+    _ = runTpmCapture(&.{ tpmBin(), "lock-read", null }, &buf, &ok);
+    return ok;
+}
+
 fn cmdUnlockBootloader(args: []const [:0]const u8) u8 {
     if (!hasFlag(args, "--confirm")) die("unlock-bootloader wipes ALL data -- re-run with --confirm");
+    if (!tpmReachable()) die("the bootloader lock is kept in the TPM and no TPM answered -- nothing was wiped");
     const n = wipeKeys() orelse die("key-custody wipe failed");
     std.debug.print("sintykey: wiped {d} key artifact(s)\n", .{n});
     if (!runTpm(&.{ tpmBin(), "verity-set-off", null })) die("TPM verity toggle set-off failed");
@@ -818,6 +826,7 @@ fn cmdUnlockBootloader(args: []const [:0]const u8) u8 {
 // enable-verity. Same --confirm gate.
 fn cmdLockBootloader(args: []const [:0]const u8) u8 {
     if (!hasFlag(args, "--confirm")) die("lock-bootloader wipes ALL data -- re-run with --confirm");
+    if (!tpmReachable()) die("the bootloader lock is kept in the TPM and no TPM answered -- nothing was wiped");
     const n = wipeKeys() orelse die("key-custody wipe failed");
     std.debug.print("sintykey: wiped {d} key artifact(s)\n", .{n});
     if (!runTpm(&.{ tpmBin(), "lock-relock", null })) die("TPM lock bit set-locked failed");
