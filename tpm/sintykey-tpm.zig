@@ -32,6 +32,7 @@ extern fn close(fd: c_int) c_int;
 extern fn fsync(fd: c_int) c_int;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern fn access(path: [*:0]const u8, mode: c_int) c_int;
 const O_RDONLY: c_int = 0;
 const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0o100;
@@ -79,15 +80,21 @@ fn writeFileSecret(path: [:0]const u8, bytes: []const u8) void {
     if (close(fd) != 0) fatal("close {s}", .{path});
 }
 
+fn localDevice() [*:0]const u8 {
+    if (access("/dev/tpmrm0", 0) == 0) return "device:/dev/tpmrm0";
+    if (access("/dev/tpm0", 0) == 0) return "device:/dev/tpm0";
+    fatal("no TPM device", .{});
+}
+
 fn esysInit() *c.ESYS_CONTEXT {
     // Silence tss2's own stderr logging: the handle-not-found (first ensure-primary) and
     // wrong-PIN (verify) paths are normal control flow. We surface REAL errors via ck().
     // overwrite=0 leaves an operator's TSS2_LOG in place for debugging.
     _ = setenv("TSS2_LOG", "all+none", 0);
     var tcti: ?*c.TSS2_TCTI_CONTEXT = null;
-    // SINTYKEY_TCTI selects the transport (swtpm in a VM, device on hw). NULL -> tctildr default.
-    const conf = getenv("SINTYKEY_TCTI");
-    ck(c.Tss2_TctiLdr_Initialize(if (conf) |cc| cc else null, &tcti), "tcti init");
+    // SINTYKEY_TCTI selects the transport (swtpm in a VM, device on hw). NULL -> local TPM device only.
+    const conf = getenv("SINTYKEY_TCTI") orelse localDevice();
+    ck(c.Tss2_TctiLdr_Initialize(conf, &tcti), "tcti init");
     var ctx: ?*c.ESYS_CONTEXT = null;
     ck(c.Esys_Initialize(&ctx, tcti, null), "esys init");
     // TPM2_SU_CLEAR; a re-startup on an already-started TPM returns INITIALIZE -- ignore it.

@@ -26,6 +26,7 @@ extern fn fork() c_int;
 extern fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 extern fn waitpid(pid: c_int, status: *c_int, options: c_int) c_int;
 extern fn getpid() c_int;
+extern fn alarm(seconds: c_uint) c_uint;
 extern fn _exit(code: c_int) noreturn;
 const O_RDONLY: c_int = 0;
 const O_APPEND: c_int = 0o2000;
@@ -134,12 +135,15 @@ fn nextLine(s: *[]const u8) []const u8 {
     return line;
 }
 
+const tpm_timeout_s: c_uint = 30;
+
 // runTpm execs sintykey-tpm with an explicit argv (no shell) and returns true on
 // exit code 0. The TPM secrets travel as 0600 files, never as argv.
 fn runTpm(argv: [*:null]const ?[*:0]const u8) bool {
     const pid = fork();
     if (pid < 0) return false;
     if (pid == 0) {
+        _ = alarm(tpm_timeout_s);
         _ = execvp(argv[0].?, argv);
         _exit(127);
     }
@@ -668,6 +672,7 @@ fn runTpmCapture(argv: [*:null]const ?[*:0]const u8, out: []u8, ok: *bool) []u8 
         _ = close(fds[0]);
         _ = dup2(fds[1], 1);
         _ = close(fds[1]);
+        _ = alarm(tpm_timeout_s);
         _ = execvp(argv[0].?, argv);
         _exit(127);
     }
