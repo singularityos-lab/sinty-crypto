@@ -28,6 +28,7 @@ extern fn waitpid(pid: c_int, status: *c_int, options: c_int) c_int;
 extern fn getpid() c_int;
 extern fn alarm(seconds: c_uint) c_uint;
 extern fn _exit(code: c_int) noreturn;
+extern fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
 const O_RDONLY: c_int = 0;
 const O_APPEND: c_int = 0o2000;
 // NOTE: no getenv -- state dir, TPM helper, and fscrypt enforcement are all
@@ -220,6 +221,80 @@ fn tpmSeal(sd: []const u8, p: *Paths, ce: *const key.Key, pin: []const u8) bool 
     return runTpm(&.{ tpmBin(), "seal", keyf.ptr, p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, null });
 }
 
+const verifier_esp = "/boot/efi/EFI/atom";
+const verifier_dir = verifier_esp ++ "/state/pin";
+
+fn copyOut(src: [*:0]const u8, dst: [:0]const u8) bool {
+    var buf: [8192]u8 = undefined;
+    const n = readFileAll(src, &buf) orelse return false;
+    var tb: [640]u8 = undefined;
+    const tmp = std.fmt.bufPrintZ(&tb, "{s}.tmp", .{dst}) catch return false;
+    const fd = open(tmp.ptr, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0o600);
+    if (fd < 0) return false;
+    var off: usize = 0;
+    while (off < n) {
+        const w = write(fd, buf[off..n].ptr, n - off);
+        if (w <= 0) {
+            _ = close(fd);
+            return false;
+        }
+        off += @intCast(w);
+    }
+    if (fsync(fd) != 0) {
+        _ = close(fd);
+        return false;
+    }
+    if (close(fd) != 0) return false;
+    return rename(tmp.ptr, dst.ptr) == 0;
+}
+
+fn verifierPath(buf: []u8, uid: []const u8, ext: []const u8) ?[:0]u8 {
+    return std.fmt.bufPrintZ(buf, "{s}/{s}.{s}", .{ verifier_dir, uid, ext }) catch null;
+}
+
+fn hasVerifier(uid: []const u8) bool {
+    var b: [512]u8 = undefined;
+    const path = verifierPath(&b, uid, "priv") orelse return false;
+    const fd = open(path.ptr, O_RDONLY | O_NOFOLLOW, 0);
+    if (fd < 0) return false;
+    _ = close(fd);
+    return true;
+}
+
+fn sealVerifier(uid: []const u8, pin: []const u8) void {
+    const efd = open(verifier_esp, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (efd < 0) return;
+    _ = close(efd);
+    _ = mkdir(verifier_esp ++ "/state", 0o755);
+    _ = mkdir(verifier_dir, 0o700);
+    var s: Paths = .{};
+    s.init(scratchDir(), uid);
+    defer _ = unlink(s.pubZ.ptr);
+    defer _ = unlink(s.privZ.ptr);
+    var v: key.Key = undefined;
+    defer std.crypto.secureZero(u8, v.bytes[0..]);
+    if (key.sintykey_generate(&v) != 0) return;
+    if (!tpmSeal(scratchDir(), &s, &v, pin)) return;
+    var pb: [512]u8 = undefined;
+    var qb: [512]u8 = undefined;
+    const dpub = verifierPath(&pb, uid, "pub") orelse return;
+    const dpriv = verifierPath(&qb, uid, "priv") orelse return;
+    if (!copyOut(s.pubZ.ptr, dpub) or !copyOut(s.privZ.ptr, dpriv))
+        std.debug.print("sintykey: the recovery PIN verifier could not be written\n", .{});
+}
+
+fn dropVerifiers() void {
+    const dir = c.opendir(verifier_dir) orelse return;
+    defer _ = c.closedir(dir);
+    while (c.readdir(dir)) |ent| {
+        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.*.d_name)), 0);
+        if (!std.mem.endsWith(u8, name, ".pub") and !std.mem.endsWith(u8, name, ".priv")) continue;
+        var pb: [1024]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&pb, "{s}/{s}", .{ verifier_dir, name }) catch continue;
+        _ = unlink(path.ptr);
+    }
+}
+
 fn setFscryptPolicy(home: [:0]const u8, ce: *const key.Key) void {
     if (!bo.enforce_fscrypt) {
         // dev/test build only -- the shipped image is built with enforce_fscrypt=true,
@@ -362,7 +437,9 @@ fn cmdProvision(args: []const [:0]const u8) u8 {
     // built with enforce_tpm to forbid the fallback.
     var p: Paths = .{};
     p.init(sd, uid);
-    if (!tpmSeal(sd, &p, &ce, pin)) {
+    if (tpmSeal(sd, &p, &ce, pin)) {
+        sealVerifier(uid, pin);
+    } else {
         if (bo.enforce_tpm)
             die("TPM seal failed and enforce_tpm set -- refusing to provision a PIN that cannot unlock");
         if (pin.len < l1_min_secret)
@@ -400,6 +477,15 @@ fn cmdVerifyPin(args: []const [:0]const u8) u8 {
     const pin = nextLine(&rest);
     var p: Paths = .{};
     p.init(sd, uid);
+    if (hasFlag(args, "--verifier")) {
+        if (!writeSecret(p.pinZ.ptr, pin)) return 1;
+        defer _ = unlink(p.pinZ.ptr);
+        var pb: [512]u8 = undefined;
+        var qb: [512]u8 = undefined;
+        const vpub = verifierPath(&pb, uid, "pub") orelse return 1;
+        const vpriv = verifierPath(&qb, uid, "priv") orelse return 1;
+        return if (runTpm(&.{ tpmBin(), "verify", p.pinZ.ptr, vpub.ptr, vpriv.ptr, null })) 0 else 1;
+    }
     if (!writeSecret(p.pinZ.ptr, pin)) return 1;
     defer _ = unlink(p.pinZ.ptr);
     if (runTpm(&.{ tpmBin(), "verify", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, null })) return 0;
@@ -429,6 +515,7 @@ fn cmdUnseal(args: []const [:0]const u8) u8 {
         if (n != KEYLEN) return 1;
         _ = write(1, &k, KEYLEN);
         std.crypto.secureZero(u8, k[0..]);
+        if (!hasVerifier(uid)) sealVerifier(uid, pin);
         return 0;
     }
     // No TPM tier (or it refused): try the software L1 tier under the same PIN. A wrong
@@ -597,7 +684,9 @@ fn cmdChangePin(args: []const [:0]const u8) u8 {
     defer std.crypto.secureZero(u8, ce.bytes[0..]);
     if (!unsealAny(sd, uid, &p, old, &ce)) return 1; // wrong old PIN or no blob
     // re-seal under the new PIN at the same tier the box supports (overwrites the blob)
-    return if (resealAny(sd, uid, &p, &ce, new)) 0 else 1;
+    if (!resealAny(sd, uid, &p, &ce, new)) return 1;
+    sealVerifier(uid, new);
+    return 0;
 }
 
 // recover: recovery-code + new PIN on stdin. Unwraps the CE key from the recovery
@@ -625,7 +714,9 @@ fn cmdRecover(args: []const [:0]const u8) u8 {
 
     var p: Paths = .{};
     p.init(sd, uid);
-    return if (resealAny(sd, uid, &p, &ce, new)) 0 else 1;
+    if (!resealAny(sd, uid, &p, &ce, new)) return 1;
+    sealVerifier(uid, new);
+    return 0;
 }
 
 // secureDir creates dir `path` with `mode` without a shell and fail-closed: mkdir sets
@@ -719,6 +810,7 @@ fn wipeKeys() ?usize {
     }
     const dir_fd = c.dirfd(dir);
     if (dir_fd < 0 or fsync(dir_fd) != 0) return null;
+    dropVerifiers();
     return removed;
 }
 
