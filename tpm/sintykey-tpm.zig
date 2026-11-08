@@ -501,6 +501,61 @@ fn verityReport(ctx: *c.ESYS_CONTEXT) u8 {
     return 0;
 }
 
+const KEY_COUNTER_FIRST: u32 = 0x01810000;
+const KEY_COUNTER_LAST: u32 = 0x0181FFFF;
+
+fn printLine(comptime fmt: []const u8, args: anytype) void {
+    var lb: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(&lb, fmt ++ "\n", args) catch return;
+    _ = write(1, line.ptr, line.len);
+}
+
+fn fingerprint(ctx: *c.ESYS_CONTEXT) void {
+    const primary = ensurePrimary(ctx);
+    var name: ?*c.TPM2B_NAME = null;
+    ck(c.Esys_ReadPublic(ctx, primary, c.ESYS_TR_NONE, c.ESYS_TR_NONE, c.ESYS_TR_NONE, null, &name, null), "readpublic");
+    defer c.Esys_Free(name);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(name.?.name[0..name.?.size], &digest, .{});
+    printLine("{x}", .{digest});
+}
+
+fn parseIndex(arg: []const u8) u32 {
+    const hex = if (std.mem.startsWith(u8, arg, "0x")) arg[2..] else arg;
+    const v = std.fmt.parseInt(u32, hex, 16) catch fatal("bad index: {s}", .{arg});
+    if (v < KEY_COUNTER_FIRST or v > KEY_COUNTER_LAST) fatal("index outside the Key counter range: {s}", .{arg});
+    return v;
+}
+
+fn counterValue(ctx: *c.ESYS_CONTEXT, h: c.ESYS_TR) u64 {
+    var data: ?*c.TPM2B_MAX_NV_BUFFER = null;
+    ck(c.Esys_NV_Read(ctx, c.ESYS_TR_RH_OWNER, h, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE, 8, 0, &data), "nv read");
+    defer c.Esys_Free(data);
+    if (data.?.size < 8) fatal("short counter", .{});
+    return std.mem.readInt(u64, data.?.buffer[0..8], .big);
+}
+
+fn counterDefine(ctx: *c.ESYS_CONTEXT) void {
+    var index = KEY_COUNTER_FIRST;
+    while (index <= KEY_COUNTER_LAST) : (index += 1) {
+        if (nvExisting(ctx, index) == null) break;
+    } else fatal("no free counter index", .{});
+    const h = nvEnsure(ctx, index, 8, true);
+    ck(c.Esys_NV_Increment(ctx, c.ESYS_TR_RH_OWNER, h, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE), "nv increment");
+    printLine("0x{x:0>8}", .{index});
+}
+
+fn counterRead(ctx: *c.ESYS_CONTEXT, arg: []const u8) void {
+    const h = nvExisting(ctx, parseIndex(arg)) orelse fatal("no counter at {s}", .{arg});
+    printLine("{d}", .{counterValue(ctx, h)});
+}
+
+fn counterBump(ctx: *c.ESYS_CONTEXT, arg: []const u8) void {
+    const h = nvExisting(ctx, parseIndex(arg)) orelse fatal("no counter at {s}", .{arg});
+    ck(c.Esys_NV_Increment(ctx, c.ESYS_TR_RH_OWNER, h, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE), "nv increment");
+    printLine("{d}", .{counterValue(ctx, h)});
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     var it = std.process.Args.Iterator.init(init.args);
     var argv: [8][:0]const u8 = undefined;
@@ -510,7 +565,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         argv[argc] = a;
         argc += 1;
     }
-    if (argc < 2) fatal("usage: sintykey-tpm ensure-primary|seal|unseal|verify|lock-read|lock-unlock|lock-relock|verity-read|verity-set-off|verity-set-on ...", .{});
+    if (argc < 2) fatal("usage: sintykey-tpm ensure-primary|seal|unseal|verify|lock-read|lock-unlock|lock-relock|verity-read|verity-set-off|verity-set-on|ek-fingerprint|counter-define|counter-read|counter-bump ...", .{});
     const cmd = argv[1];
     const ctx = esysInit(); // one-shot CLI: the process exits right after, so the OS reclaims the ESYS ctx
 
@@ -543,6 +598,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         verityWrite(ctx, VERITY_OFF);
     } else if (std.mem.eql(u8, cmd, "verity-set-on")) {
         verityWrite(ctx, VERITY_ON);
+    } else if (std.mem.eql(u8, cmd, "ek-fingerprint")) {
+        fingerprint(ctx);
+    } else if (std.mem.eql(u8, cmd, "counter-define")) {
+        counterDefine(ctx);
+    } else if (std.mem.eql(u8, cmd, "counter-read")) {
+        if (argc < 3) fatal("counter-read needs <index>", .{});
+        counterRead(ctx, argv[2]);
+    } else if (std.mem.eql(u8, cmd, "counter-bump")) {
+        if (argc < 3) fatal("counter-bump needs <index>", .{});
+        counterBump(ctx, argv[2]);
     } else {
         fatal("unknown command: {s}", .{cmd});
     }

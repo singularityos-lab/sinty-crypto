@@ -14,7 +14,17 @@ sintykey-tpm ensure-primary
 sintykey-tpm seal   <keyfile> <pinfile> <pub_out> <priv_out>
 sintykey-tpm unseal <pinfile> <pub> <priv> <out>
 sintykey-tpm verify <pinfile> <pub> <priv>          # exit 0 ok, 1 wrong PIN
+sintykey-tpm ek-fingerprint                          # stdout: hex SHA-256 of the primary's name
+sintykey-tpm counter-define                          # stdout: index of a new NV counter
+sintykey-tpm counter-read <index>                    # stdout: value
+sintykey-tpm counter-bump <index>                    # stdout: new value
 ```
+
+The fingerprint identifies the TPM: the primary is derived from the endorsement
+seed, so it is the same on every boot. Counters are `TPM2_NT_COUNTER` indices
+in `0x01810000`-`0x0181FFFF`, defined and incremented once so they can be read
+at once; they are only ever incremented. The Sinty Key service uses them to
+refuse older copies of a Key.
 
 The sealed object lives under a persistent ECC storage primary at `0x81000001`.
 The pub/priv blobs are marshalled with `Tss2_MU` and written 0600; the key never
