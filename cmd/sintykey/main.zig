@@ -763,6 +763,7 @@ fn cmdUnlockDevice(args: []const [:0]const u8) u8 {
         const n = readFileAll(keyZ.ptr, de.bytes[0..]) orelse return 0; // not provisioned -> inert
         if (n != KEYLEN) return 1;
     }
+    if (portable()) writeStatus("portable", "1\n");
 
     // Add the key to the mount's filesystem so its policy'd subdirs decrypt.
     var mz: [512]u8 = undefined;
