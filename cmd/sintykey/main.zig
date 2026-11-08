@@ -29,6 +29,7 @@ extern fn getpid() c_int;
 extern fn alarm(seconds: c_uint) c_uint;
 extern fn _exit(code: c_int) noreturn;
 extern fn rename(old: [*:0]const u8, new: [*:0]const u8) c_int;
+extern fn time(t: ?*i64) i64;
 const O_RDONLY: c_int = 0;
 const O_APPEND: c_int = 0o2000;
 // NOTE: no getenv -- state dir, TPM helper, and fscrypt enforcement are all
@@ -45,6 +46,59 @@ const KEYLEN = 32;
 // must carry the strength in the secret itself: a short PIN is refused there and a real
 // passphrase is required. On the hardware tiers a short PIN stays safe (the TPM throttles).
 const l1_min_secret = 12;
+const portable_min_secret = 4;
+const portable_free_tries = 3;
+const portable_max_wait: i64 = 3600;
+
+fn portable() bool {
+    var b: [512]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&b, "{s}/portable", .{stateDir()}) catch return false;
+    const fd = open(z.ptr, O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0) return false;
+    _ = close(fd);
+    return true;
+}
+
+fn triesPath(buf: []u8, uid: []const u8) ?[:0]u8 {
+    return std.fmt.bufPrintZ(buf, "{s}/{s}.tries", .{ stateDir(), uid }) catch null;
+}
+
+fn readTries(uid: []const u8, count: *u32, last: *i64) void {
+    count.* = 0;
+    last.* = 0;
+    var pb: [512]u8 = undefined;
+    const path = triesPath(&pb, uid) orelse return;
+    var buf: [64]u8 = undefined;
+    const n = readFileAll(path.ptr, &buf) orelse return;
+    var it = std.mem.tokenizeAny(u8, buf[0..n], " \n");
+    count.* = std.fmt.parseInt(u32, it.next() orelse return, 10) catch 0;
+    last.* = std.fmt.parseInt(i64, it.next() orelse return, 10) catch 0;
+}
+
+fn tryWait(count: u32) i64 {
+    if (count < portable_free_tries) return 0;
+    const shift: u6 = @intCast(@min(count - portable_free_tries, 12));
+    return @min(@as(i64, 5) << shift, portable_max_wait);
+}
+
+fn softUnsealCounted(sd: []const u8, uid: []const u8, secret: []const u8, k: *key.Key) bool {
+    if (!portable()) return softUnseal(sd, uid, secret, k);
+    var count: u32 = 0;
+    var last: i64 = 0;
+    readTries(uid, &count, &last);
+    const now = time(null);
+    if (now < last + tryWait(count)) return false;
+    var pb: [512]u8 = undefined;
+    const path = triesPath(&pb, uid) orelse return false;
+    if (softUnseal(sd, uid, secret, k)) {
+        _ = unlink(path.ptr);
+        return true;
+    }
+    var out: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(&out, "{d} {d}\n", .{ count + 1, now }) catch return false;
+    _ = writeSecret(path.ptr, line);
+    return false;
+}
 
 fn die(msg: []const u8) noreturn {
     std.debug.print("sintykey: {s}\n", .{msg});
@@ -356,6 +410,10 @@ fn softSeal(sd: []const u8, name: []const u8, k: *const key.Key, secret: []const
 // software L1 fallback (unless enforce_tpm forbids it). Used by provision/change-pin/recover
 // so every write path degrades identically.
 fn resealAny(sd: []const u8, uid: []const u8, p: *Paths, k: *const key.Key, secret: []const u8) bool {
+    if (portable()) {
+        _ = tpmSeal(sd, p, k, secret);
+        return secret.len >= portable_min_secret and softSeal(sd, uid, k, secret);
+    }
     if (tpmSeal(sd, p, k, secret)) return true;
     if (bo.enforce_tpm) return false;
     if (secret.len < l1_min_secret) return false; // L1 needs a real passphrase, not a short PIN
@@ -374,7 +432,7 @@ fn unsealAny(sd: []const u8, uid: []const u8, p: *Paths, secret: []const u8, k: 
         _ = unlink(outf.ptr);
         return n != null and n.? == KEYLEN;
     }
-    return softUnseal(sd, uid, secret, k);
+    return softUnsealCounted(sd, uid, secret, k);
 }
 
 // softUnseal reads state_dir/{name}.soft and unwraps `k` under `secret`. Returns false
@@ -437,7 +495,10 @@ fn cmdProvision(args: []const [:0]const u8) u8 {
     // built with enforce_tpm to forbid the fallback.
     var p: Paths = .{};
     p.init(sd, uid);
-    if (tpmSeal(sd, &p, &ce, pin)) {
+    if (portable()) {
+        if (tpmSeal(sd, &p, &ce, pin)) sealVerifier(uid, pin);
+        if (!softSeal(sd, uid, &ce, pin)) die("cannot write the portable wrap of the key");
+    } else if (tpmSeal(sd, &p, &ce, pin)) {
         sealVerifier(uid, pin);
     } else {
         if (bo.enforce_tpm)
@@ -492,7 +553,7 @@ fn cmdVerifyPin(args: []const [:0]const u8) u8 {
     // Software L1 tier: a correct PIN unwraps the blob (AEAD tag holds); a wrong one fails.
     var k: key.Key = undefined;
     defer std.crypto.secureZero(u8, k.bytes[0..]);
-    return if (softUnseal(sd, uid, pin, &k)) 0 else 1;
+    return if (softUnsealCounted(sd, uid, pin, &k)) 0 else 1;
 }
 
 // unseal: PIN on stdin, the raw 32-byte CE key on stdout (for pam_sinty).
@@ -521,7 +582,7 @@ fn cmdUnseal(args: []const [:0]const u8) u8 {
     // No TPM tier (or it refused): try the software L1 tier under the same PIN. A wrong
     // PIN fails the AEAD tag here, exactly as it fails the TPM authValue above.
     var sk: key.Key = undefined;
-    if (!softUnseal(sd, uid, pin, &sk)) return 1;
+    if (!softUnsealCounted(sd, uid, pin, &sk)) return 1;
     _ = write(1, &sk.bytes, KEYLEN);
     std.crypto.secureZero(u8, sk.bytes[0..]);
     return 0;
@@ -613,6 +674,11 @@ fn cmdProvisionDevice(_: []const [:0]const u8) u8 {
     const pubZ = std.fmt.bufPrintZ(&pubmark, "{s}/device.pub", .{sd}) catch die("path too long");
     if (tpmSeal(sd, &p, &de, "")) {
         std.debug.print("sintykey: device key sealed to TPM\n", .{});
+        if (portable()) {
+            var kb: [512]u8 = undefined;
+            const keyZ = std.fmt.bufPrintZ(&kb, "{s}/device.key", .{sd}) catch die("path too long");
+            if (!writeSecret(keyZ.ptr, de.bytes[0..])) die("cannot write device key");
+        }
     } else {
         if (bo.enforce_tpm) die("TPM seal failed and enforce_tpm set -- cannot provision the device key");
         var kb: [512]u8 = undefined;
@@ -652,9 +718,16 @@ fn cmdUnlockDevice(args: []const [:0]const u8) u8 {
         defer _ = unlink(outf.ptr);
         _ = writeSecret(p.pinZ.ptr, "");
         defer _ = unlink(p.pinZ.ptr);
-        if (!runTpm(&.{ tpmBin(), "unseal", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, outf.ptr, null })) return 1;
-        const n = readFileAll(outf.ptr, de.bytes[0..]) orelse return 1;
-        if (n != KEYLEN) return 1;
+        if (runTpm(&.{ tpmBin(), "unseal", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, outf.ptr, null })) {
+            const n = readFileAll(outf.ptr, de.bytes[0..]) orelse return 1;
+            if (n != KEYLEN) return 1;
+        } else {
+            if (!portable()) return 1;
+            var kb: [512]u8 = undefined;
+            const keyZ = std.fmt.bufPrintZ(&kb, "{s}/device.key", .{sd}) catch die("path too long");
+            const n = readFileAll(keyZ.ptr, de.bytes[0..]) orelse return 1;
+            if (n != KEYLEN) return 1;
+        }
     } else {
         var kb: [512]u8 = undefined;
         const keyZ = std.fmt.bufPrintZ(&kb, "{s}/device.key", .{sd}) catch die("path too long");
