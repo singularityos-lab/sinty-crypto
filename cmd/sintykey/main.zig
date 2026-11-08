@@ -81,22 +81,50 @@ fn tryWait(count: u32) i64 {
     return @min(@as(i64, 5) << shift, portable_max_wait);
 }
 
+fn writeStatus(name: []const u8, data: []const u8) void {
+    var db: [512]u8 = undefined;
+    const dz = std.fmt.bufPrintZ(&db, "{s}", .{bo.status_dir}) catch return;
+    _ = mkdir(dz.ptr, 0o755);
+    _ = chmod(dz.ptr, 0o755);
+    var pb: [512]u8 = undefined;
+    const pz = std.fmt.bufPrintZ(&pb, "{s}/{s}", .{ bo.status_dir, name }) catch return;
+    const fd = open(pz.ptr, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0o644);
+    if (fd < 0) return;
+    _ = fchmod(fd, 0o644);
+    _ = write(fd, data.ptr, data.len);
+    _ = close(fd);
+}
+
+fn clearStatus(name: []const u8) void {
+    var pb: [512]u8 = undefined;
+    const pz = std.fmt.bufPrintZ(&pb, "{s}/{s}", .{ bo.status_dir, name }) catch return;
+    _ = unlink(pz.ptr);
+}
+
 fn softUnsealCounted(sd: []const u8, uid: []const u8, secret: []const u8, k: *key.Key) bool {
     if (!portable()) return softUnseal(sd, uid, secret, k);
     var count: u32 = 0;
     var last: i64 = 0;
     readTries(uid, &count, &last);
     const now = time(null);
+    var nb: [64]u8 = undefined;
+    const wait_name = std.fmt.bufPrint(&nb, "wait-{s}", .{uid}) catch return false;
     if (now < last + tryWait(count)) return false;
     var pb: [512]u8 = undefined;
     const path = triesPath(&pb, uid) orelse return false;
     if (softUnseal(sd, uid, secret, k)) {
         _ = unlink(path.ptr);
+        clearStatus(wait_name);
         return true;
     }
     var out: [64]u8 = undefined;
     const line = std.fmt.bufPrint(&out, "{d} {d}\n", .{ count + 1, now }) catch return false;
     _ = writeSecret(path.ptr, line);
+    const wait = tryWait(count + 1);
+    if (wait > 0) {
+        var wb: [32]u8 = undefined;
+        writeStatus(wait_name, std.fmt.bufPrint(&wb, "{d}\n", .{now + wait}) catch return false);
+    }
     return false;
 }
 
@@ -727,6 +755,7 @@ fn cmdUnlockDevice(args: []const [:0]const u8) u8 {
             const keyZ = std.fmt.bufPrintZ(&kb, "{s}/device.key", .{sd}) catch die("path too long");
             const n = readFileAll(keyZ.ptr, de.bytes[0..]) orelse return 1;
             if (n != KEYLEN) return 1;
+            writeStatus("guest", "1\n");
         }
     } else {
         var kb: [512]u8 = undefined;

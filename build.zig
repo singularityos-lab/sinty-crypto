@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
     // predictable secret files and read the unsealed CE key). Transient plaintext (PIN, raw CE/
     // device key, unseal output) goes here so cleartext never hits the unencrypted persistent disk.
     opts.addOption([]const u8, "scratch_dir", b.option([]const u8, "scratch-dir", "dedicated root-only tmpfs scratch for transient plaintext secrets") orelse "/run/sintykey");
+    opts.addOption([]const u8, "status_dir", b.option([]const u8, "status-dir", "world-readable unlock status (guest mode, retry wait)") orelse "/run/sinty-key");
     opts.addOption([]const u8, "tpm_bin", b.option([]const u8, "tpm-bin", "path to sintykey-tpm") orelse "/usr/libexec/sintykey-tpm");
     opts.addOption(bool, "enforce_fscrypt", b.option(bool, "enforce-fscrypt", "provision MUST set an fscrypt policy (no skip)") orelse true);
     // provision MUST seal to a working TPM: otherwise it would silently create an
