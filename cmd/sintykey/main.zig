@@ -529,7 +529,7 @@ fn cmdProvision(args: []const [:0]const u8) u8 {
         if (!softSeal(sd, uid, &ce, pin)) die("cannot write the portable wrap of the key");
     } else if (tpmSeal(sd, &p, &ce, pin)) {
         sealVerifier(uid, pin);
-        writeStatus("tier", "tpm 4\n");
+        noteTier(sd, "tpm 4\n");
     } else {
         if (bo.enforce_tpm)
             die("TPM seal failed and enforce_tpm set -- refusing to provision a PIN that cannot unlock");
@@ -538,7 +538,7 @@ fn cmdProvision(args: []const [:0]const u8) u8 {
         if (!softSeal(sd, uid, &ce, pin))
             die("both TPM and software seal failed -- cannot secure the PIN");
         std.debug.print("sintykey: no TPM -- provisioned at software tier (L1, passphrase-protected)\n", .{});
-        writeStatus("tier", "passphrase 12\n");
+        noteTier(sd, "passphrase 12\n");
     }
 
     // Recovery wrap: the escape hatch for a forgotten PIN or a cleared TPM.
@@ -962,6 +962,20 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
+fn readTierFile(sd: []const u8, buf: []u8) ?[]const u8 {
+    var tb: [512]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&tb, "{s}/tier", .{sd}) catch return null;
+    const n = readFileAll(path.ptr, buf) orelse return null;
+    return buf[0..n];
+}
+
+fn noteTier(sd: []const u8, line: []const u8) void {
+    writeStatus("tier", line);
+    var tb: [512]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&tb, "{s}/tier", .{sd}) catch return;
+    _ = writeSecret(path.ptr, line);
+}
+
 fn cmdTier(args: []const [:0]const u8) u8 {
     const sd = stateDir();
     var tier: []const u8 = "passphrase";
@@ -980,6 +994,11 @@ fn cmdTier(args: []const [:0]const u8) u8 {
         const soft_blob = std.fmt.bufPrint(&pb, "{s}/{s}.soft", .{ sd, uid }) catch break :blk;
         if (fileExists(soft_blob)) break :blk;
         if (runTpm(&.{ tpmBin(), "ensure-primary", null })) {
+            tier = "tpm";
+            min = 4;
+        }
+    } else if (readTierFile(sd, &pb)) |saved| {
+        if (std.mem.startsWith(u8, saved, "tpm")) {
             tier = "tpm";
             min = 4;
         }
