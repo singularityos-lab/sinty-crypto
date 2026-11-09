@@ -191,10 +191,17 @@ fn keyCleanup(pamh: ?*c.pam_handle_t, data: ?*anyopaque, ec: c_int) callconv(.c)
     }
 }
 
+fn hasArg(argc: c_int, argv: [*c][*c]const u8, name: []const u8) bool {
+    if (argv == null) return false;
+    var i: usize = 0;
+    while (i < @as(usize, @intCast(@max(argc, 0)))) : (i += 1) {
+        if (argv[i] != null and std.mem.eql(u8, std.mem.span(argv[i]), name)) return true;
+    }
+    return false;
+}
+
 export fn pam_sm_authenticate(pamh: ?*c.pam_handle_t, flags: c_int, argc: c_int, argv: [*c][*c]const u8) callconv(.c) c_int {
     _ = flags;
-    _ = argc;
-    _ = argv;
 
     var user: [*c]const u8 = null;
     if (c.pam_get_user(pamh, &user, null) != c.PAM_SUCCESS or user == null) return c.PAM_USER_UNKNOWN;
@@ -215,7 +222,7 @@ export fn pam_sm_authenticate(pamh: ?*c.pam_handle_t, flags: c_int, argc: c_int,
         std.c.free(pin);
     }
 
-    if (getuid() != 0) {
+    if (getuid() != 0 or hasArg(argc, argv, "verify")) {
         switch (verifyViaDaemon(uidZ, pin)) {
             .ok => return c.PAM_SUCCESS,
             .fail => return c.PAM_AUTH_ERR,
