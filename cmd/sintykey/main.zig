@@ -529,6 +529,7 @@ fn cmdProvision(args: []const [:0]const u8) u8 {
         if (!softSeal(sd, uid, &ce, pin)) die("cannot write the portable wrap of the key");
     } else if (tpmSeal(sd, &p, &ce, pin)) {
         sealVerifier(uid, pin);
+        writeStatus("tier", "tpm 4\n");
     } else {
         if (bo.enforce_tpm)
             die("TPM seal failed and enforce_tpm set -- refusing to provision a PIN that cannot unlock");
@@ -537,6 +538,7 @@ fn cmdProvision(args: []const [:0]const u8) u8 {
         if (!softSeal(sd, uid, &ce, pin))
             die("both TPM and software seal failed -- cannot secure the PIN");
         std.debug.print("sintykey: no TPM -- provisioned at software tier (L1, passphrase-protected)\n", .{});
+        writeStatus("tier", "passphrase 12\n");
     }
 
     // Recovery wrap: the escape hatch for a forgotten PIN or a cleared TPM.
@@ -987,6 +989,7 @@ fn cmdTier(args: []const [:0]const u8) u8 {
     }
     var ob: [64]u8 = undefined;
     const line = std.fmt.bufPrint(&ob, "{s} {d}\n", .{ tier, min }) catch return 1;
+    if (argFlag(args, "--uid") == null) writeStatus("tier", line);
     _ = write(1, line.ptr, line.len);
     return 0;
 }
