@@ -102,7 +102,8 @@ fn clearStatus(name: []const u8) void {
 }
 
 fn softUnsealCounted(sd: []const u8, uid: []const u8, secret: []const u8, k: *key.Key) bool {
-    if (!portable()) return softUnseal(sd, uid, secret, k);
+    var sp: [512]u8 = undefined;
+    if (!fileExists(std.fmt.bufPrint(&sp, "{s}/{s}.soft", .{ sd, uid }) catch return false)) return false;
     var count: u32 = 0;
     var last: i64 = 0;
     readTries(uid, &count, &last);
@@ -950,6 +951,46 @@ fn cmdLockState(_: []const [:0]const u8) u8 {
 
 // verity-state: print the dm-verity policy the loader must apply, straight from the TPM NV
 // verity toggle (verity=on|off). Fail closed to verity=on. This is the loader's read seam.
+fn fileExists(path: []const u8) bool {
+    var b: [512]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&b, "{s}", .{path}) catch return false;
+    const fd = open(z.ptr, O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0) return false;
+    _ = close(fd);
+    return true;
+}
+
+fn cmdTier(args: []const [:0]const u8) u8 {
+    const sd = stateDir();
+    var tier: []const u8 = "passphrase";
+    var min: usize = l1_min_secret;
+    var pb: [512]u8 = undefined;
+    if (portable()) {
+        tier = "portable";
+        min = portable_min_secret;
+    } else if (argFlag(args, "--uid")) |uid| blk: {
+        const tpm_blob = std.fmt.bufPrint(&pb, "{s}/{s}.priv", .{ sd, uid }) catch break :blk;
+        if (fileExists(tpm_blob)) {
+            tier = "tpm";
+            min = 4;
+            break :blk;
+        }
+        const soft_blob = std.fmt.bufPrint(&pb, "{s}/{s}.soft", .{ sd, uid }) catch break :blk;
+        if (fileExists(soft_blob)) break :blk;
+        if (runTpm(&.{ tpmBin(), "ensure-primary", null })) {
+            tier = "tpm";
+            min = 4;
+        }
+    } else if (runTpm(&.{ tpmBin(), "ensure-primary", null })) {
+        tier = "tpm";
+        min = 4;
+    }
+    var ob: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(&ob, "{s} {d}\n", .{ tier, min }) catch return 1;
+    _ = write(1, line.ptr, line.len);
+    return 0;
+}
+
 fn cmdVerityState(_: []const [:0]const u8) u8 {
     var buf: [64]u8 = undefined;
     var ok: bool = false;
@@ -1048,7 +1089,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         n += 1;
     }
     const args = argv[0..n];
-    if (args.len < 2) die("usage: sintykey <provision|provision-device|unlock-device|change-pin|verify-pin|unseal|recover|mkdirs|lock-state|verity-state|wipe-var|set-unlock|set-lock|disable-verity|enable-verity|unlock-bootloader|lock-bootloader> [flags]");
+    if (args.len < 2) die("usage: sintykey <tier|provision|provision-device|unlock-device|change-pin|verify-pin|unseal|recover|mkdirs|lock-state|verity-state|wipe-var|set-unlock|set-lock|disable-verity|enable-verity|unlock-bootloader|lock-bootloader> [flags]");
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "mkdirs")) return cmdMkdirs(args);
     if (std.mem.eql(u8, cmd, "lock-state")) return cmdLockState(args);
@@ -1060,6 +1101,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (std.mem.eql(u8, cmd, "enable-verity")) return cmdEnableVerity(args);
     if (std.mem.eql(u8, cmd, "unlock-bootloader")) return cmdUnlockBootloader(args);
     if (std.mem.eql(u8, cmd, "lock-bootloader")) return cmdLockBootloader(args);
+    if (std.mem.eql(u8, cmd, "tier")) return cmdTier(args);
     if (std.mem.eql(u8, cmd, "provision")) return cmdProvision(args);
     if (std.mem.eql(u8, cmd, "provision-device")) return cmdProvisionDevice(args);
     if (std.mem.eql(u8, cmd, "unlock-device")) return cmdUnlockDevice(args);
