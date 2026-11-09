@@ -43,6 +43,15 @@ extern fn execv(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 extern fn waitpid(pid: c_int, status: *c_int, options: c_int) c_int;
 extern fn _exit(code: c_int) noreturn;
 extern fn getpid() c_int;
+extern fn getuid() c_uint;
+extern fn geteuid() c_uint;
+extern fn setresuid(r: c_uint, e: c_uint, s: c_uint) c_int;
+extern fn setresgid(r: c_uint, e: c_uint, s: c_uint) c_int;
+extern fn setgroups(n: usize, list: ?*const c_uint) c_int;
+extern fn execve(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
+extern fn socket(domain: c_int, kind: c_int, proto: c_int) c_int;
+extern fn connect(fd: c_int, addr: *const anyopaque, len: u32) c_int;
+extern fn setsockopt(fd: c_int, level: c_int, name: c_int, val: *const anyopaque, len: u32) c_int;
 const O_RDONLY: c_int = 0;
 const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0o100;
@@ -73,6 +82,7 @@ fn dbgCrown(comptime fmt: []const u8, args: anytype) void {
 const DATA_KEY = "sinty_ce_key";
 const SINTYKEY_BIN = "/usr/bin/sintykey"; // fixed path (no PATH lookup in a PAM context)
 const KEYLEN = 32;
+const RECOVERD_SOCK = "/run/sinty-recoverd.sock";
 const Key = extern struct { bytes: [KEYLEN]u8 };
 
 fn askPin(pamh: ?*c.pam_handle_t) ?[*:0]u8 {
@@ -112,6 +122,12 @@ fn unsealViaCli(uid: [*:0]const u8, pin: [*:0]const u8) ?Key {
         _ = dup2(out_p[1], 1);
         for ([_]c_int{ in_p[0], in_p[1], out_p[0], out_p[1] }) |fd| _ = close(fd);
         const argv = [_:null]?[*:0]const u8{ SINTYKEY_BIN, "unseal", "--uid", uid };
+        if (getuid() != 0 and geteuid() == 0) {
+            if (setgroups(0, null) != 0 or setresgid(0, 0, 0) != 0 or setresuid(0, 0, 0) != 0) _exit(127);
+            const envp = [_:null]?[*:0]const u8{"PATH=/usr/sbin:/usr/bin"};
+            _ = execve(SINTYKEY_BIN, &argv, &envp);
+            _exit(127);
+        }
         _ = execv(SINTYKEY_BIN, &argv);
         _exit(127);
     }
@@ -135,6 +151,34 @@ fn unsealViaCli(uid: [*:0]const u8, pin: [*:0]const u8) ?Key {
         return null;
     }
     return k;
+}
+
+const Verdict = enum { ok, fail, absent };
+
+fn verifyViaDaemon(uid: []const u8, pin: [*:0]const u8) Verdict {
+    const fd = socket(1, 1 | O_CLOEXEC, 0);
+    if (fd < 0) return .absent;
+    defer _ = close(fd);
+    const tv = extern struct { sec: i64, usec: i64 }{ .sec = 6, .usec = 0 };
+    _ = setsockopt(fd, 1, 20, &tv, @sizeOf(@TypeOf(tv)));
+    _ = setsockopt(fd, 1, 21, &tv, @sizeOf(@TypeOf(tv)));
+    var addr = extern struct { family: u16, path: [108]u8 }{ .family = 1, .path = [_]u8{0} ** 108 };
+    @memcpy(addr.path[0..RECOVERD_SOCK.len], RECOVERD_SOCK);
+    if (connect(fd, &addr, @sizeOf(@TypeOf(addr))) != 0) return .absent;
+    const p = std.mem.span(pin);
+    var msg: [320]u8 = undefined;
+    const line = std.fmt.bufPrint(&msg, "verify\n{s}\n{s}\n", .{ uid, p }) catch return .fail;
+    defer std.crypto.secureZero(u8, msg[0..]);
+    var off: usize = 0;
+    while (off < line.len) {
+        const w = write(fd, line[off..].ptr, line.len - off);
+        if (w <= 0) return .fail;
+        off += @intCast(w);
+    }
+    var reply: [16]u8 = undefined;
+    const n = read(fd, &reply, reply.len);
+    if (n >= 2 and reply[0] == 'O' and reply[1] == 'K') return .ok;
+    return .fail;
 }
 
 fn keyCleanup(pamh: ?*c.pam_handle_t, data: ?*anyopaque, ec: c_int) callconv(.c) void {
@@ -169,6 +213,14 @@ export fn pam_sm_authenticate(pamh: ?*c.pam_handle_t, flags: c_int, argc: c_int,
         const span = std.mem.span(pin);
         std.crypto.secureZero(u8, span);
         std.c.free(pin);
+    }
+
+    if (getuid() != 0) {
+        switch (verifyViaDaemon(uidZ, pin)) {
+            .ok => return c.PAM_SUCCESS,
+            .fail => return c.PAM_AUTH_ERR,
+            .absent => {},
+        }
     }
 
     var ce = unsealViaCli(uidZ.ptr, pin) orelse return c.PAM_AUTH_ERR;
