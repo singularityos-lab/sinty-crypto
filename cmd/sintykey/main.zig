@@ -224,6 +224,7 @@ const tpm_timeout_s: c_uint = 30;
 // runTpm execs sintykey-tpm with an explicit argv (no shell) and returns true on
 // exit code 0. The TPM secrets travel as 0600 files, never as argv.
 fn runTpm(argv: [*:null]const ?[*:0]const u8) bool {
+    if (portable()) return false;
     const pid = fork();
     if (pid < 0) return false;
     if (pid == 0) {
@@ -856,6 +857,10 @@ extern fn dup2(oldfd: c_int, newfd: c_int) c_int;
 // captured slice (empty on failure). Used for lock-read, whose one-line state output the
 // wrapper parses. Secrets never travel this path (lock state is not a secret).
 fn runTpmCapture(argv: [*:null]const ?[*:0]const u8, out: []u8, ok: *bool) []u8 {
+    if (portable()) {
+        ok.* = false;
+        return out[0..0];
+    }
     ok.* = false;
     var fds: [2]c_int = undefined;
     if (pipe(&fds) != 0) return out[0..0];
