@@ -32,7 +32,15 @@ pub fn build(b: *std.Build) void {
     // E2E-only: logs fscrypt key identifiers + key hashes to /var/lib/sinty/.dbg-*
     // for debugging fscrypt key issues across reboots. NEVER set in a release image.
     opts.addOption(bool, "debug_e2e", b.option(bool, "debug-e2e", "E2E diagnostics to .dbg-* files") orelse false);
+    opts.addOption(i32, "fido2_test_fd", b.option(i32, "fido2-test-fd", "inherited descriptor used as the only security key (tests)") orelse -1);
     const opts_mod = opts.createModule();
+
+    const fido2_mod = b.createModule(.{
+        .root_source_file = b.path("fido2/fido2.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
 
     const mod = b.createModule(.{
         .root_source_file = b.path("libsintykey/libsintykey.zig"),
@@ -77,6 +85,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "sintykey", .module = mod },
                 .{ .name = "build_options", .module = opts_mod },
+                .{ .name = "fido2", .module = fido2_mod },
             },
         }),
     });
@@ -105,5 +114,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }) });
-    b.step("test", "run tests").dependOn(&b.addRunArtifact(t).step);
+    const test_step = b.step("test", "run tests");
+    test_step.dependOn(&b.addRunArtifact(t).step);
+    const ft = b.addTest(.{ .root_module = fido2_mod });
+    test_step.dependOn(&b.addRunArtifact(ft).step);
+    const kt = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("cmd/sintykey/security_keys.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "fido2", .module = fido2_mod }},
+    }) });
+    test_step.dependOn(&b.addRunArtifact(kt).step);
 }

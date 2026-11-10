@@ -6,6 +6,7 @@
 const std = @import("std");
 const key = @import("sintykey");
 const bo = @import("build_options");
+const keys = @import("security_keys.zig");
 const c = @cImport({
     @cInclude("linux/fscrypt.h");
     @cInclude("sys/ioctl.h");
@@ -127,6 +128,79 @@ fn softUnsealCounted(sd: []const u8, uid: []const u8, secret: []const u8, k: *ke
         writeStatus(wait_name, std.fmt.bufPrint(&wb, "{d}\n", .{now + wait}) catch return false);
     }
     return false;
+}
+
+fn keysPath(buf: []u8, dir: []const u8, uid: []const u8) ?[:0]u8 {
+    return std.fmt.bufPrintZ(buf, "{s}/{s}.fido2", .{ dir, uid }) catch null;
+}
+
+fn loadKeys(dir: []const u8, uid: []const u8, store: *keys.Store) bool {
+    var pb: [512]u8 = undefined;
+    const path = keysPath(&pb, dir, uid) orelse return false;
+    var buf: [4096]u8 = undefined;
+    const n = readFileAll(path.ptr, &buf) orelse return false;
+    store.* = keys.Store.parse(buf[0..n]) orelse die("the security key list is damaged");
+    return true;
+}
+
+fn storeKeys(dir: []const u8, uid: []const u8, data: ?[]const u8) bool {
+    var pb: [512]u8 = undefined;
+    const path = keysPath(&pb, dir, uid) orelse return false;
+    const d = data orelse return unlink(path.ptr) == 0 or !fileExists(path);
+    var tb: [600]u8 = undefined;
+    const tmp = std.fmt.bufPrintZ(&tb, "{s}.tmp", .{path}) catch return false;
+    if (!writeSecret(tmp.ptr, d)) return false;
+    return rename(tmp.ptr, path.ptr) == 0;
+}
+
+fn saveKeys(sd: []const u8, uid: []const u8, store: *const keys.Store) bool {
+    var buf: [4096]u8 = undefined;
+    const data: ?[]const u8 = if (store.count == 0) null else (store.serialize(&buf) orelse return false);
+    if (!storeKeys(sd, uid, data)) return false;
+    if (hasVerifier(uid)) _ = storeKeys(verifier_dir, uid, data);
+    markKeys(uid, store.count);
+    return true;
+}
+
+fn markKeys(uid: []const u8, count: usize) void {
+    var nb: [64]u8 = undefined;
+    const name = std.fmt.bufPrint(&nb, "{s}.security-keys", .{uid}) catch return;
+    if (count == 0) return clearStatus(name);
+    var lb: [16]u8 = undefined;
+    writeStatus(name, std.fmt.bufPrint(&lb, "{d}\n", .{count}) catch return);
+}
+
+fn failKey(f: keys.Failure) noreturn {
+    std.debug.print("sintykey: {s}\n", .{f.message()});
+    std.process.exit(3);
+}
+
+const Secret = struct {
+    value: []const u8,
+    keyed: bool,
+    factor: [32]u8 = undefined,
+    buf: [32]u8 = undefined,
+
+    fn wipe(s: *Secret) void {
+        std.crypto.secureZero(u8, &s.factor);
+        std.crypto.secureZero(u8, &s.buf);
+    }
+
+    fn with(s: *Secret, pin: []const u8, out: *[32]u8) []const u8 {
+        return if (s.keyed) keys.mix(&s.factor, pin, out) else pin;
+    }
+};
+
+fn secretFor(dir: []const u8, uid: []const u8, pin: []const u8, s: *Secret) void {
+    var store: keys.Store = undefined;
+    if (!loadKeys(dir, uid, &store)) {
+        s.* = .{ .value = pin, .keyed = false };
+        return;
+    }
+    s.keyed = true;
+    markKeys(uid, store.count);
+    if (keys.unlock(&store, uid, bo.fido2_test_fd, &s.factor)) |f| failKey(f);
+    s.value = keys.mix(&s.factor, pin, &s.buf);
 }
 
 fn die(msg: []const u8) noreturn {
@@ -553,6 +627,10 @@ fn cmdProvision(args: []const [:0]const u8) u8 {
     const rp = std.fmt.bufPrintZ(&rbuf, "{s}/{s}.recovery", .{ sd, uid }) catch die("uid too long");
     if (!writeSecret(rp.ptr, blob[0..blen])) die("cannot write recovery blob");
 
+    var none: keys.Store = .{};
+    none.count = 0;
+    _ = saveKeys(sd, uid, &none);
+
     // fscrypt: encrypt the (empty) home under this key.
     setFscryptPolicy(homeZ, &ce);
 
@@ -567,7 +645,11 @@ fn cmdVerifyPin(args: []const [:0]const u8) u8 {
     const sd = stateDir();
     var buf: [256]u8 = undefined;
     var rest: []const u8 = readStdin(&buf);
-    const pin = nextLine(&rest);
+    const typed = nextLine(&rest);
+    var secret: Secret = undefined;
+    defer secret.wipe();
+    secretFor(if (hasFlag(args, "--verifier")) verifier_dir else sd, uid, typed, &secret);
+    const pin = secret.value;
     var p: Paths = .{};
     p.init(sd, uid);
     if (hasFlag(args, "--verifier")) {
@@ -594,7 +676,11 @@ fn cmdUnseal(args: []const [:0]const u8) u8 {
     const sd = stateDir();
     var buf: [256]u8 = undefined;
     var rest: []const u8 = readStdin(&buf);
-    const pin = nextLine(&rest);
+    const typed = nextLine(&rest);
+    var secret: Secret = undefined;
+    defer secret.wipe();
+    secretFor(sd, uid, typed, &secret);
+    const pin = secret.value;
     var p: Paths = .{};
     p.init(sd, uid);
     if (!writeSecret(p.pinZ.ptr, pin)) return 1;
@@ -787,12 +873,19 @@ fn cmdChangePin(args: []const [:0]const u8) u8 {
     var p: Paths = .{};
     p.init(sd, uid);
 
+    var secret: Secret = undefined;
+    defer secret.wipe();
+    secretFor(sd, uid, old, &secret);
+    var nb: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &nb);
+    const next = secret.with(new, &nb);
+
     var ce: key.Key = undefined;
     defer std.crypto.secureZero(u8, ce.bytes[0..]);
-    if (!unsealAny(sd, uid, &p, old, &ce)) return 1; // wrong old PIN or no blob
+    if (!unsealAny(sd, uid, &p, secret.value, &ce)) return 1; // wrong old PIN or no blob
     // re-seal under the new PIN at the same tier the box supports (overwrites the blob)
-    if (!resealAny(sd, uid, &p, &ce, new)) return 1;
-    sealVerifier(uid, new);
+    if (!resealAny(sd, uid, &p, &ce, next)) return 1;
+    sealVerifier(uid, next);
     return 0;
 }
 
@@ -823,6 +916,92 @@ fn cmdRecover(args: []const [:0]const u8) u8 {
     p.init(sd, uid);
     if (!resealAny(sd, uid, &p, &ce, new)) return 1;
     sealVerifier(uid, new);
+    var none: keys.Store = .{};
+    none.count = 0;
+    if (!saveKeys(sd, uid, &none)) std.debug.print("sintykey: the security keys could not be removed\n", .{});
+    return 0;
+}
+
+fn cmdSecurityKeys(args: []const [:0]const u8) u8 {
+    const uid = argFlag(args, "--uid") orelse die("security-keys needs --uid");
+    var store: keys.Store = undefined;
+    if (!loadKeys(stateDir(), uid, &store)) return 0;
+    for (store.entries[0..store.count], 0..) |*e, i| {
+        var lb: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(&lb, "{d}\t{s}\n", .{ i, e.label() }) catch continue;
+        _ = write(1, line.ptr, line.len);
+    }
+    return 0;
+}
+
+fn cmdAddSecurityKey(args: []const [:0]const u8) u8 {
+    const uid = argFlag(args, "--uid") orelse die("add-security-key needs --uid");
+    const name = argFlag(args, "--name") orelse "Security key";
+    const sd = stateDir();
+    var buf: [512]u8 = undefined;
+    var rest: []const u8 = readStdin(&buf);
+    const pin = nextLine(&rest);
+    const device_pin = nextLine(&rest);
+
+    var store: keys.Store = .{};
+    var secret: Secret = undefined;
+    defer secret.wipe();
+    secretFor(sd, uid, pin, &secret);
+    if (secret.keyed) {
+        _ = loadKeys(sd, uid, &store);
+    } else {
+        keys.fido2.fill(&secret.factor) catch die("no randomness");
+        keys.fido2.fill(&store.salt) catch die("no randomness");
+        store.count = 0;
+    }
+    var p: Paths = .{};
+    p.init(sd, uid);
+    var ce: key.Key = undefined;
+    defer std.crypto.secureZero(u8, ce.bytes[0..]);
+    if (!unsealAny(sd, uid, &p, secret.value, &ce)) return 1;
+
+    if (keys.enroll(&store, uid, bo.fido2_test_fd, &secret.factor, name, if (device_pin.len > 0) device_pin else null)) |f| failKey(f);
+    if (!saveKeys(sd, uid, &store)) die("cannot write the security key list");
+    if (!secret.keyed) {
+        var nb: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &nb);
+        const next = keys.mix(&secret.factor, pin, &nb);
+        if (!resealAny(sd, uid, &p, &ce, next)) {
+            var none: keys.Store = .{};
+            none.count = 0;
+            _ = saveKeys(sd, uid, &none);
+            die("cannot seal the key with the security key");
+        }
+        sealVerifier(uid, next);
+        if (hasVerifier(uid)) _ = saveKeys(sd, uid, &store);
+    }
+    return 0;
+}
+
+fn cmdRemoveSecurityKey(args: []const [:0]const u8) u8 {
+    const uid = argFlag(args, "--uid") orelse die("remove-security-key needs --uid");
+    const index = std.fmt.parseInt(usize, argFlag(args, "--index") orelse die("remove-security-key needs --index"), 10) catch die("bad index");
+    const sd = stateDir();
+    var buf: [256]u8 = undefined;
+    var rest: []const u8 = readStdin(&buf);
+    const pin = nextLine(&rest);
+
+    var store: keys.Store = undefined;
+    if (!loadKeys(sd, uid, &store) or index >= store.count) failKey(.unknown);
+    var secret: Secret = undefined;
+    defer secret.wipe();
+    secretFor(sd, uid, pin, &secret);
+    var p: Paths = .{};
+    p.init(sd, uid);
+    var ce: key.Key = undefined;
+    defer std.crypto.secureZero(u8, ce.bytes[0..]);
+    if (!unsealAny(sd, uid, &p, secret.value, &ce)) return 1;
+    if (store.count == 1) {
+        if (!resealAny(sd, uid, &p, &ce, pin)) die("this PIN is too short to protect the computer without a security key");
+        sealVerifier(uid, pin);
+    }
+    store.remove(index);
+    if (!saveKeys(sd, uid, &store)) die("cannot write the security key list");
     return 0;
 }
 
@@ -1116,7 +1295,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         n += 1;
     }
     const args = argv[0..n];
-    if (args.len < 2) die("usage: sintykey <tier|provision|provision-device|unlock-device|change-pin|verify-pin|unseal|recover|mkdirs|lock-state|verity-state|wipe-var|set-unlock|set-lock|disable-verity|enable-verity|unlock-bootloader|lock-bootloader> [flags]");
+    if (args.len < 2) die("usage: sintykey <tier|provision|provision-device|unlock-device|change-pin|verify-pin|unseal|recover|mkdirs|lock-state|verity-state|wipe-var|set-unlock|set-lock|disable-verity|enable-verity|unlock-bootloader|lock-bootloader|security-keys|add-security-key|remove-security-key> [flags]");
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "mkdirs")) return cmdMkdirs(args);
     if (std.mem.eql(u8, cmd, "lock-state")) return cmdLockState(args);
@@ -1136,5 +1315,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (std.mem.eql(u8, cmd, "verify-pin")) return cmdVerifyPin(args);
     if (std.mem.eql(u8, cmd, "unseal")) return cmdUnseal(args);
     if (std.mem.eql(u8, cmd, "recover")) return cmdRecover(args);
+    if (std.mem.eql(u8, cmd, "security-keys")) return cmdSecurityKeys(args);
+    if (std.mem.eql(u8, cmd, "add-security-key")) return cmdAddSecurityKey(args);
+    if (std.mem.eql(u8, cmd, "remove-security-key")) return cmdRemoveSecurityKey(args);
     die("unknown subcommand");
 }

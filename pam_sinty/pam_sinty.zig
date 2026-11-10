@@ -100,6 +100,29 @@ fn askPin(pamh: ?*c.pam_handle_t) ?[*:0]u8 {
     return @ptrCast(pin);
 }
 
+fn hasSecurityKeys(uid: []const u8) bool {
+    var pb: [512]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&pb, "{s}/{s}.security-keys", .{ bo.status_dir, uid }) catch return false;
+    const fd = open(path.ptr, O_CLOEXEC, 0);
+    if (fd < 0) return false;
+    _ = close(fd);
+    return true;
+}
+
+fn touchHint(pamh: ?*c.pam_handle_t) void {
+    var item: ?*const anyopaque = null;
+    if (c.pam_get_item(pamh, c.PAM_CONV, &item) != c.PAM_SUCCESS or item == null) return;
+    const conv: *const c.pam_conv = @ptrCast(@alignCast(item));
+    const cb = conv.conv orelse return;
+    var msg = c.pam_message{ .msg_style = c.PAM_TEXT_INFO, .msg = "Touch your security key." };
+    var msgs = [_][*c]const c.pam_message{&msg};
+    var resp: [*c]c.pam_response = null;
+    if (cb(1, &msgs, &resp, conv.appdata_ptr) == c.PAM_SUCCESS and resp != null) {
+        if (resp[0].resp != null) std.c.free(resp[0].resp);
+        std.c.free(resp);
+    }
+}
+
 // unsealViaCli execs `sintykey unseal --uid <uid>`, pipes the PIN to its stdin, and
 // reads the raw 32-byte CE key from its stdout. Returns null on any failure (wrong
 // PIN -> non-zero exit, throttled by the TPM lockout).
@@ -159,7 +182,7 @@ fn verifyViaDaemon(uid: []const u8, pin: [*:0]const u8) Verdict {
     const fd = socket(1, 1 | O_CLOEXEC, 0);
     if (fd < 0) return .absent;
     defer _ = close(fd);
-    const tv = extern struct { sec: i64, usec: i64 }{ .sec = 6, .usec = 0 };
+    const tv = extern struct { sec: i64, usec: i64 }{ .sec = if (hasSecurityKeys(uid)) 40 else 6, .usec = 0 };
     _ = setsockopt(fd, 1, 20, &tv, @sizeOf(@TypeOf(tv)));
     _ = setsockopt(fd, 1, 21, &tv, @sizeOf(@TypeOf(tv)));
     var addr = extern struct { family: u16, path: [108]u8 }{ .family = 1, .path = [_]u8{0} ** 108 };
@@ -221,6 +244,8 @@ export fn pam_sm_authenticate(pamh: ?*c.pam_handle_t, flags: c_int, argc: c_int,
         std.crypto.secureZero(u8, span);
         std.c.free(pin);
     }
+
+    if (hasSecurityKeys(uidZ)) touchHint(pamh);
 
     if (getuid() != 0 or hasArg(argc, argv, "verify")) {
         switch (verifyViaDaemon(uidZ, pin)) {
