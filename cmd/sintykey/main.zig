@@ -922,6 +922,27 @@ fn cmdRecover(args: []const [:0]const u8) u8 {
     return 0;
 }
 
+fn cmdUnwrapRecovery(args: []const [:0]const u8) u8 {
+    const uid = argFlag(args, "--uid") orelse die("unwrap-recovery needs --uid");
+    const sd = stateDir();
+    var buf: [512]u8 = undefined;
+    defer std.crypto.secureZero(u8, buf[0..]);
+    var rest: []const u8 = readStdin(&buf);
+    const code = nextLine(&rest);
+    var cb: [128]u8 = undefined;
+    defer std.crypto.secureZero(u8, cb[0..]);
+    const codeZ = std.fmt.bufPrintZ(&cb, "{s}", .{code}) catch die("recovery code too long");
+    var rbuf: [512]u8 = undefined;
+    const rp = std.fmt.bufPrintZ(&rbuf, "{s}/{s}.recovery", .{ sd, uid }) catch die("uid too long");
+    var blob: [128]u8 = undefined;
+    const blen = readFileAll(rp.ptr, &blob) orelse return 1;
+    var ce: key.Key = undefined;
+    defer std.crypto.secureZero(u8, ce.bytes[0..]);
+    if (key.sintykey_recovery_unwrap(&blob, blen, codeZ.ptr, &ce) != 0) return 1;
+    _ = write(1, &ce.bytes, KEYLEN);
+    return 0;
+}
+
 fn cmdSecurityKeys(args: []const [:0]const u8) u8 {
     const uid = argFlag(args, "--uid") orelse die("security-keys needs --uid");
     var store: keys.Store = undefined;
@@ -1295,7 +1316,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         n += 1;
     }
     const args = argv[0..n];
-    if (args.len < 2) die("usage: sintykey <tier|provision|provision-device|unlock-device|change-pin|verify-pin|unseal|recover|mkdirs|lock-state|verity-state|wipe-var|set-unlock|set-lock|disable-verity|enable-verity|unlock-bootloader|lock-bootloader|security-keys|add-security-key|remove-security-key> [flags]");
+    if (args.len < 2) die("usage: sintykey <tier|provision|provision-device|unlock-device|change-pin|verify-pin|unseal|recover|unwrap-recovery|mkdirs|lock-state|verity-state|wipe-var|set-unlock|set-lock|disable-verity|enable-verity|unlock-bootloader|lock-bootloader|security-keys|add-security-key|remove-security-key> [flags]");
     const cmd = args[1];
     if (std.mem.eql(u8, cmd, "mkdirs")) return cmdMkdirs(args);
     if (std.mem.eql(u8, cmd, "lock-state")) return cmdLockState(args);
@@ -1315,6 +1336,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (std.mem.eql(u8, cmd, "verify-pin")) return cmdVerifyPin(args);
     if (std.mem.eql(u8, cmd, "unseal")) return cmdUnseal(args);
     if (std.mem.eql(u8, cmd, "recover")) return cmdRecover(args);
+    if (std.mem.eql(u8, cmd, "unwrap-recovery")) return cmdUnwrapRecovery(args);
     if (std.mem.eql(u8, cmd, "security-keys")) return cmdSecurityKeys(args);
     if (std.mem.eql(u8, cmd, "add-security-key")) return cmdAddSecurityKey(args);
     if (std.mem.eql(u8, cmd, "remove-security-key")) return cmdRemoveSecurityKey(args);
