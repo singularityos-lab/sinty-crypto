@@ -34,6 +34,7 @@ fn accountLocked(user: [*c]const u8) bool {
 // libc, declared directly: <fcntl.h> fortify wrappers break translate-c.
 extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern fn close(fd: c_int) c_int;
+extern fn unlink(path: [*:0]const u8) c_int;
 extern fn read(fd: c_int, buf: [*]u8, n: usize) isize;
 extern fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
 extern fn pipe(fds: *[2]c_int) c_int;
@@ -58,6 +59,9 @@ const O_CREAT: c_int = 0o100;
 const O_APPEND: c_int = 0o2000;
 const O_DIRECTORY: c_int = 0o200000;
 const O_CLOEXEC: c_int = 0o2000000;
+const O_NOFOLLOW: c_int = 0o400000;
+const BADGE_USER = "sinty-badge";
+const BADGE_TICKET = "/run/sinty-badge/ticket";
 
 // Compile-time-gated fscrypt key diagnostics (dev builds only).
 fn dbgHex(bytes: []const u8, out: []u8) []const u8 {
@@ -223,6 +227,35 @@ fn hasArg(argc: c_int, argv: [*c][*c]const u8, name: []const u8) bool {
     return false;
 }
 
+fn takeTicket(out: *[64]u8) bool {
+    const fd = open(BADGE_TICKET, O_RDONLY | O_NOFOLLOW | O_CLOEXEC, 0);
+    if (fd < 0) return false;
+    _ = unlink(BADGE_TICKET);
+    defer _ = close(fd);
+    var buf: [66]u8 = undefined;
+    const n = read(fd, &buf, buf.len);
+    defer std.crypto.secureZero(u8, buf[0..]);
+    if (n != 64 and !(n == 65 and buf[64] == '\n')) return false;
+    @memcpy(out[0..], buf[0..64]);
+    return true;
+}
+
+fn badgeAuthenticate(pamh: ?*c.pam_handle_t) c_int {
+    if (getuid() != 0 and geteuid() != 0) return c.PAM_AUTH_ERR;
+    const resp = askPin(pamh) orelse return c.PAM_CONV_ERR;
+    defer {
+        std.crypto.secureZero(u8, std.mem.span(resp));
+        std.c.free(resp);
+    }
+    var want: [64]u8 = undefined;
+    defer std.crypto.secureZero(u8, want[0..]);
+    if (!takeTicket(&want)) return c.PAM_AUTH_ERR;
+    const got = std.mem.span(resp);
+    if (got.len != want.len) return c.PAM_AUTH_ERR;
+    if (!std.crypto.timing_safe.eql([64]u8, got[0..64].*, want)) return c.PAM_AUTH_ERR;
+    return c.PAM_SUCCESS;
+}
+
 export fn pam_sm_authenticate(pamh: ?*c.pam_handle_t, flags: c_int, argc: c_int, argv: [*c][*c]const u8) callconv(.c) c_int {
     _ = flags;
 
@@ -235,6 +268,7 @@ export fn pam_sm_authenticate(pamh: ?*c.pam_handle_t, flags: c_int, argc: c_int,
         if (bo.debug_e2e) dbgCrown("auth user={s} REFUSED: account locked\n", .{std.mem.span(user)});
         return c.PAM_AUTH_ERR;
     }
+    if (std.mem.eql(u8, std.mem.span(user), BADGE_USER)) return badgeAuthenticate(pamh);
     var uidbuf: [16]u8 = undefined;
     const uidZ = std.fmt.bufPrintZ(&uidbuf, "{d}", .{pw.*.pw_uid}) catch return c.PAM_AUTH_ERR;
 
