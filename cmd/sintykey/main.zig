@@ -298,9 +298,15 @@ const tpm_timeout_s: c_uint = 30;
 // runTpm execs sintykey-tpm with an explicit argv (no shell) and returns true on
 // exit code 0. The TPM secrets travel as 0600 files, never as argv.
 fn runTpm(argv: [*:null]const ?[*:0]const u8) bool {
-    if (portable()) return false;
+    return runTpmCode(argv) == 0;
+}
+
+const TPM_EXIT_LOCKOUT: c_int = 75;
+
+fn runTpmCode(argv: [*:null]const ?[*:0]const u8) c_int {
+    if (portable()) return -1;
     const pid = fork();
-    if (pid < 0) return false;
+    if (pid < 0) return -1;
     if (pid == 0) {
         _ = alarm(tpm_timeout_s);
         _ = execvp(argv[0].?, argv);
@@ -308,7 +314,29 @@ fn runTpm(argv: [*:null]const ?[*:0]const u8) bool {
     }
     var status: c_int = 0;
     _ = waitpid(pid, &status, 0);
-    return (status & 0x7f) == 0 and ((status >> 8) & 0xff) == 0;
+    if ((status & 0x7f) != 0) return -1;
+    return (status >> 8) & 0xff;
+}
+
+fn noteTpmLockout(uid: []const u8) void {
+    writeTpmWait(uid, true);
+}
+
+fn noteTpmFailure(uid: []const u8, rc: c_int) void {
+    if (rc == TPM_EXIT_LOCKOUT) writeTpmWait(uid, true) else if (rc > 0) writeTpmWait(uid, false);
+}
+
+fn writeTpmWait(uid: []const u8, locked: bool) void {
+    var nb: [64]u8 = undefined;
+    const wait_name = std.fmt.bufPrint(&nb, "wait-{s}", .{uid}) catch return;
+    var buf: [32]u8 = undefined;
+    var ok = false;
+    const out = runTpmCapture(&.{ tpmBin(), "lockout-wait", null }, &buf, &ok);
+    const secs = if (ok) std.fmt.parseInt(i64, std.mem.trim(u8, out, " \n"), 10) catch 0 else 0;
+    if (!locked and secs <= 0) return;
+    const wait: i64 = if (secs > 0) secs else 60;
+    var wb: [32]u8 = undefined;
+    writeStatus(wait_name, std.fmt.bufPrint(&wb, "{d}\n", .{time(null) + wait}) catch return);
 }
 
 fn writeSecret(path: [*:0]const u8, data: []const u8) bool {
@@ -531,11 +559,19 @@ fn unsealAny(sd: []const u8, uid: []const u8, p: *Paths, secret: []const u8, k: 
     defer _ = unlink(p.pinZ.ptr);
     var ob: [512]u8 = undefined;
     const outf = std.fmt.bufPrintZ(&ob, "{s}/.out.{s}.{d}", .{ scratchDir(), uid, getpid() }) catch return false;
-    if (runTpm(&.{ tpmBin(), "unseal", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, outf.ptr, null })) {
+    const rc = runTpmCode(&.{ tpmBin(), "unseal", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, outf.ptr, null });
+    if (rc == 0) {
         const n = readFileAll(outf.ptr, k.bytes[0..]);
         _ = unlink(outf.ptr);
+        var nb: [64]u8 = undefined;
+        if (std.fmt.bufPrint(&nb, "wait-{s}", .{uid})) |wait_name| clearStatus(wait_name) else |_| {}
         return n != null and n.? == KEYLEN;
     }
+    if (rc == TPM_EXIT_LOCKOUT) {
+        noteTpmLockout(uid);
+        return false;
+    }
+    noteTpmFailure(uid, rc);
     return softUnsealCounted(sd, uid, secret, k);
 }
 
@@ -659,15 +695,28 @@ fn cmdVerifyPin(args: []const [:0]const u8) u8 {
         var qb: [512]u8 = undefined;
         const vpub = verifierPath(&pb, uid, "pub") orelse return 1;
         const vpriv = verifierPath(&qb, uid, "priv") orelse return 1;
-        return if (runTpm(&.{ tpmBin(), "verify", p.pinZ.ptr, vpub.ptr, vpriv.ptr, null })) 0 else 1;
+        return verifyCode(uid, runTpmCode(&.{ tpmBin(), "verify", p.pinZ.ptr, vpub.ptr, vpriv.ptr, null }));
     }
     if (!writeSecret(p.pinZ.ptr, pin)) return 1;
     defer _ = unlink(p.pinZ.ptr);
-    if (runTpm(&.{ tpmBin(), "verify", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, null })) return 0;
+    const rc = runTpmCode(&.{ tpmBin(), "verify", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, null });
+    if (rc == 0 or rc == TPM_EXIT_LOCKOUT) return verifyCode(uid, rc);
+    noteTpmFailure(uid, rc);
     // Software L1 tier: a correct PIN unwraps the blob (AEAD tag holds); a wrong one fails.
     var k: key.Key = undefined;
     defer std.crypto.secureZero(u8, k.bytes[0..]);
     return if (softUnsealCounted(sd, uid, pin, &k)) 0 else 1;
+}
+
+fn verifyCode(uid: []const u8, rc: c_int) u8 {
+    var nb: [64]u8 = undefined;
+    const wait_name = std.fmt.bufPrint(&nb, "wait-{s}", .{uid}) catch return 1;
+    if (rc == 0) {
+        clearStatus(wait_name);
+        return 0;
+    }
+    noteTpmFailure(uid, rc);
+    return 1;
 }
 
 // unseal: PIN on stdin, the raw 32-byte CE key on stdout (for pam_sinty).
@@ -688,15 +737,23 @@ fn cmdUnseal(args: []const [:0]const u8) u8 {
     var ob: [512]u8 = undefined;
     const outf = std.fmt.bufPrintZ(&ob, "{s}/.out.{s}.{d}", .{ scratchDir(), uid, getpid() }) catch die("path too long");
     defer _ = unlink(outf.ptr);
-    if (runTpm(&.{ tpmBin(), "unseal", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, outf.ptr, null })) {
+    const rc = runTpmCode(&.{ tpmBin(), "unseal", p.pinZ.ptr, p.pubZ.ptr, p.privZ.ptr, outf.ptr, null });
+    if (rc == 0) {
         var k: [KEYLEN]u8 = undefined;
         const n = readFileAll(outf.ptr, &k) orelse return 1;
         if (n != KEYLEN) return 1;
         _ = write(1, &k, KEYLEN);
         std.crypto.secureZero(u8, k[0..]);
         if (!hasVerifier(uid)) sealVerifier(uid, pin);
+        var nb: [64]u8 = undefined;
+        if (std.fmt.bufPrint(&nb, "wait-{s}", .{uid})) |wait_name| clearStatus(wait_name) else |_| {}
         return 0;
     }
+    if (rc == TPM_EXIT_LOCKOUT) {
+        noteTpmLockout(uid);
+        return 1;
+    }
+    noteTpmFailure(uid, rc);
     // No TPM tier (or it refused): try the software L1 tier under the same PIN. A wrong
     // PIN fails the AEAD tag here, exactly as it fails the TPM authValue above.
     var sk: key.Key = undefined;

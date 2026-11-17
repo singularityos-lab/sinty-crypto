@@ -260,6 +260,36 @@ fn doSeal(ctx: *c.ESYS_CONTEXT, keyfile: [:0]const u8, pinfile: [:0]const u8, pu
 // Load the sealed object and unseal it with the PIN. Returns the unsealed bytes into `out`
 // on success; returns null when the PIN is wrong (or the object won't load) so the caller
 // can map that to a clean verify/unseal failure without a fatal.
+const EXIT_LOCKOUT: u8 = 75;
+
+var locked_out = false;
+
+fn noteLockout(rc: c.TSS2_RC) void {
+    if ((rc & 0xfff) == c.TPM2_RC_LOCKOUT) locked_out = true;
+}
+
+fn lockoutWait(ctx: *c.ESYS_CONTEXT) u8 {
+    var more: c.TPMI_YES_NO = 0;
+    var data: ?*c.TPMS_CAPABILITY_DATA = null;
+    if (c.Esys_GetCapability(ctx, c.ESYS_TR_NONE, c.ESYS_TR_NONE, c.ESYS_TR_NONE, c.TPM2_CAP_TPM_PROPERTIES, c.TPM2_PT_LOCKOUT_COUNTER, 3, &more, &data) != c.TSS2_RC_SUCCESS) return 1;
+    defer c.Esys_Free(data);
+    const props = data.?.data.tpmProperties;
+    var counter: u32 = 0;
+    var max: u32 = 0;
+    var interval: u32 = 0;
+    for (props.tpmProperty[0..props.count]) |p| switch (p.property) {
+        c.TPM2_PT_LOCKOUT_COUNTER => counter = p.value,
+        c.TPM2_PT_MAX_AUTH_FAIL => max = p.value,
+        c.TPM2_PT_LOCKOUT_INTERVAL => interval = p.value,
+        else => {},
+    };
+    const wait: u64 = if (max > 0 and counter >= max) @as(u64, counter - max + 1) * interval else 0;
+    var buf: [32]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "{d}\n", .{wait}) catch return 1;
+    _ = write(1, line.ptr, line.len);
+    return 0;
+}
+
 fn tryUnseal(ctx: *c.ESYS_CONTEXT, pinfile: [:0]const u8, pubIn: [:0]const u8, privIn: [:0]const u8, out: []u8) ?[]u8 {
     const primary = ensurePrimary(ctx);
     var pbuf: [4096]u8 = undefined;
@@ -275,8 +305,11 @@ fn tryUnseal(ctx: *c.ESYS_CONTEXT, pinfile: [:0]const u8, pubIn: [:0]const u8, p
     ck(c.Tss2_MU_TPM2B_PRIVATE_Unmarshal(&rbuf, rb.len, &off, &privBlob), "unmarshal priv");
 
     var item: c.ESYS_TR = c.ESYS_TR_NONE;
-    if (c.Esys_Load(ctx, primary, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &privBlob, &pubBlob, &item) != c.TSS2_RC_SUCCESS)
+    const lrc = c.Esys_Load(ctx, primary, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &privBlob, &pubBlob, &item);
+    if (lrc != c.TSS2_RC_SUCCESS) {
+        noteLockout(lrc);
         return null;
+    }
     defer _ = c.Esys_FlushContext(ctx, item);
 
     var pinbuf: [256]u8 = undefined;
@@ -307,8 +340,11 @@ fn tryUnseal(ctx: *c.ESYS_CONTEXT, pinfile: [:0]const u8, pubIn: [:0]const u8, p
     var outData: ?*c.TPM2B_SENSITIVE_DATA = null;
     // A wrong PIN (or, for a PCR-bound object, a changed PCR state) fails here and advances
     // the DA lockout -> not fatal, just "no".
-    if (c.Esys_Unseal(ctx, item, authSession, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &outData) != c.TSS2_RC_SUCCESS)
+    const urc = c.Esys_Unseal(ctx, item, authSession, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &outData);
+    if (urc != c.TSS2_RC_SUCCESS) {
+        noteLockout(urc);
         return null;
+    }
     defer {
         c.Esys_Free(outData);
     }
@@ -565,7 +601,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         argv[argc] = a;
         argc += 1;
     }
-    if (argc < 2) fatal("usage: sintykey-tpm ensure-primary|seal|unseal|verify|lock-read|lock-unlock|lock-relock|verity-read|verity-set-off|verity-set-on|ek-fingerprint|counter-define|counter-read|counter-bump ...", .{});
+    if (argc < 2) fatal("usage: sintykey-tpm ensure-primary|seal|unseal|verify|lockout-wait|lock-read|lock-unlock|lock-relock|verity-read|verity-set-off|verity-set-on|ek-fingerprint|counter-define|counter-read|counter-bump ...", .{});
     const cmd = argv[1];
     const ctx = esysInit(); // one-shot CLI: the process exits right after, so the OS reclaims the ESYS ctx
 
@@ -577,7 +613,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     } else if (std.mem.eql(u8, cmd, "unseal")) {
         if (argc < 6) fatal("unseal needs <pinfile> <pub> <priv> <out>", .{});
         var out: [256]u8 = undefined;
-        const r = tryUnseal(ctx, argv[2], argv[3], argv[4], &out) orelse fatal("unseal failed (wrong PIN or bad object)", .{});
+        const r = tryUnseal(ctx, argv[2], argv[3], argv[4], &out) orelse {
+            if (locked_out) {
+                std.debug.print("sintykey-tpm: unseal refused, the TPM is locked out after too many attempts\n", .{});
+                return EXIT_LOCKOUT;
+            }
+            fatal("unseal failed (wrong PIN or bad object)", .{});
+        };
         writeFileSecret(argv[5], r);
         std.crypto.secureZero(u8, &out);
     } else if (std.mem.eql(u8, cmd, "verify")) {
@@ -585,7 +627,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var out: [256]u8 = undefined;
         const ok = tryUnseal(ctx, argv[2], argv[3], argv[4], &out) != null;
         std.crypto.secureZero(u8, &out);
-        return if (ok) 0 else 1;
+        return if (ok) 0 else if (locked_out) EXIT_LOCKOUT else 1;
+    } else if (std.mem.eql(u8, cmd, "lockout-wait")) {
+        return lockoutWait(ctx);
     } else if (std.mem.eql(u8, cmd, "lock-read")) {
         return lockReport(ctx);
     } else if (std.mem.eql(u8, cmd, "lock-unlock")) {
