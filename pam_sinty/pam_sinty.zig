@@ -57,8 +57,10 @@ const O_RDONLY: c_int = 0;
 const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0o100;
 const O_APPEND: c_int = 0o2000;
+// DEVICE-FIX(arm64): O_DIRECTORY differs per architecture; the x86 value is O_DIRECT on aarch64, so opens on tmpfs fail and provisioning dies
 const O_DIRECTORY: c_int = @bitCast(std.posix.O{ .DIRECTORY = true });
 const O_CLOEXEC: c_int = 0o2000000;
+// DEVICE-FIX(arm64): O_NOFOLLOW differs per architecture; the x86 value is O_LARGEFILE on aarch64 and the symlink guard is lost
 const O_NOFOLLOW: c_int = @bitCast(std.posix.O{ .NOFOLLOW = true });
 const BADGE_USER = "sinty-badge";
 const BADGE_TICKET = "/run/sinty-badge/ticket";

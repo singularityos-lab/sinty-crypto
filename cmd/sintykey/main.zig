@@ -39,6 +39,7 @@ const O_APPEND: c_int = 0o2000;
 const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0o100;
 const O_TRUNC: c_int = 0o1000;
+// DEVICE-FIX(arm64): O_DIRECTORY differs per architecture; the x86 value is O_DIRECT on aarch64, so opens on tmpfs fail and provisioning dies
 const O_DIRECTORY: c_int = @bitCast(std.posix.O{ .DIRECTORY = true });
 const O_CLOEXEC: c_int = 0o2000000;
 
@@ -221,6 +222,7 @@ fn scratchDir() []const u8 {
 extern fn chmod(path: [*:0]const u8, mode: c_uint) c_int;
 extern fn fchmod(fd: c_int, mode: c_uint) c_int;
 extern fn fchown(fd: c_int, owner: c_uint, group: c_uint) c_int;
+// DEVICE-FIX(arm64): O_NOFOLLOW differs per architecture; the x86 value is O_LARGEFILE on aarch64 and the symlink guard is lost
 const O_NOFOLLOW: c_int = @bitCast(std.posix.O{ .NOFOLLOW = true });
 fn ensureScratch() void {
     var b: [512]u8 = undefined;
