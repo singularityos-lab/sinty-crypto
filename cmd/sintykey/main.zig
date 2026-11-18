@@ -39,7 +39,7 @@ const O_APPEND: c_int = 0o2000;
 const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0o100;
 const O_TRUNC: c_int = 0o1000;
-const O_DIRECTORY: c_int = 0o200000;
+const O_DIRECTORY: c_int = @bitCast(std.posix.O{ .DIRECTORY = true });
 const O_CLOEXEC: c_int = 0o2000000;
 
 const KEYLEN = 32;
@@ -221,7 +221,7 @@ fn scratchDir() []const u8 {
 extern fn chmod(path: [*:0]const u8, mode: c_uint) c_int;
 extern fn fchmod(fd: c_int, mode: c_uint) c_int;
 extern fn fchown(fd: c_int, owner: c_uint, group: c_uint) c_int;
-const O_NOFOLLOW: c_int = 0o400000;
+const O_NOFOLLOW: c_int = @bitCast(std.posix.O{ .NOFOLLOW = true });
 fn ensureScratch() void {
     var b: [512]u8 = undefined;
     const z = std.fmt.bufPrintZ(&b, "{s}", .{scratchDir()}) catch return;

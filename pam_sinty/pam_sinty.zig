@@ -57,9 +57,9 @@ const O_RDONLY: c_int = 0;
 const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = 0o100;
 const O_APPEND: c_int = 0o2000;
-const O_DIRECTORY: c_int = 0o200000;
+const O_DIRECTORY: c_int = @bitCast(std.posix.O{ .DIRECTORY = true });
 const O_CLOEXEC: c_int = 0o2000000;
-const O_NOFOLLOW: c_int = 0o400000;
+const O_NOFOLLOW: c_int = @bitCast(std.posix.O{ .NOFOLLOW = true });
 const BADGE_USER = "sinty-badge";
 const BADGE_TICKET = "/run/sinty-badge/ticket";
 
