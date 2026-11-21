@@ -210,6 +210,23 @@ fn verifyViaDaemon(uid: []const u8, pin: [*:0]const u8) Verdict {
     return .fail;
 }
 
+fn armQuickUnlock(uid: c_uint) void {
+    const fd = socket(1, 1 | O_CLOEXEC, 0);
+    if (fd < 0) return;
+    defer _ = close(fd);
+    const tv = extern struct { sec: i64, usec: i64 }{ .sec = 2, .usec = 0 };
+    _ = setsockopt(fd, 1, 20, &tv, @sizeOf(@TypeOf(tv)));
+    _ = setsockopt(fd, 1, 21, &tv, @sizeOf(@TypeOf(tv)));
+    var addr = extern struct { family: u16, path: [108]u8 }{ .family = 1, .path = [_]u8{0} ** 108 };
+    @memcpy(addr.path[0..RECOVERD_SOCK.len], RECOVERD_SOCK);
+    if (connect(fd, &addr, @sizeOf(@TypeOf(addr))) != 0) return;
+    var msg: [32]u8 = undefined;
+    const line = std.fmt.bufPrint(&msg, "arm\n{d}\n", .{uid}) catch return;
+    if (write(fd, line.ptr, line.len) != @as(isize, @intCast(line.len))) return;
+    var reply: [8]u8 = undefined;
+    _ = read(fd, &reply, reply.len);
+}
+
 fn keyCleanup(pamh: ?*c.pam_handle_t, data: ?*anyopaque, ec: c_int) callconv(.c) void {
     _ = pamh;
     _ = ec;
@@ -365,6 +382,7 @@ export fn pam_sm_open_session(pamh: ?*c.pam_handle_t, flags: c_int, argc: c_int,
         dbgCrown("session user={s} pid={d} pw_dir={s} add-key rc={d} added-id={s}\n", .{ uname, getpid(), std.mem.span(pw.*.pw_dir), rc, dbgHex(arg.key_spec.u.identifier[0..16], &idhex) });
     }
     if (rc != 0) return c.PAM_SESSION_ERR;
+    armQuickUnlock(pw.*.pw_uid);
     // Positive crown proof: IN this session, with the key just added, does the
     // user's encrypted /home actually decrypt? Reading a plaintext-named file
     // succeeds only if the key is active. (The post-pam_end cat in a test harness
