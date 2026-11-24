@@ -92,12 +92,16 @@ const RECOVERD_SOCK = "/run/sinty-recoverd.sock";
 const Key = extern struct { bytes: [KEYLEN]u8 };
 
 fn askPin(pamh: ?*c.pam_handle_t) ?[*:0]u8 {
+    return askSecret(pamh, "PIN: ");
+}
+
+fn askSecret(pamh: ?*c.pam_handle_t, prompt: [*:0]const u8) ?[*:0]u8 {
     var item: ?*const anyopaque = null;
     if (c.pam_get_item(pamh, c.PAM_CONV, &item) != c.PAM_SUCCESS or item == null) return null;
     const conv: *const c.pam_conv = @ptrCast(@alignCast(item));
     const cb = conv.conv orelse return null;
 
-    var msg = c.pam_message{ .msg_style = c.PAM_PROMPT_ECHO_OFF, .msg = "PIN: " };
+    var msg = c.pam_message{ .msg_style = c.PAM_PROMPT_ECHO_OFF, .msg = prompt };
     var msgs = [_][*c]const c.pam_message{&msg};
     var resp: [*c]c.pam_response = null;
     if (cb(1, &msgs, &resp, conv.appdata_ptr) != c.PAM_SUCCESS or resp == null) return null;
@@ -116,17 +120,187 @@ fn hasSecurityKeys(uid: []const u8) bool {
 }
 
 fn touchHint(pamh: ?*c.pam_handle_t) void {
+    tell(pamh, c.PAM_TEXT_INFO, "Touch your security key.");
+}
+
+fn tell(pamh: ?*c.pam_handle_t, style: c_int, text: [*:0]const u8) void {
     var item: ?*const anyopaque = null;
     if (c.pam_get_item(pamh, c.PAM_CONV, &item) != c.PAM_SUCCESS or item == null) return;
     const conv: *const c.pam_conv = @ptrCast(@alignCast(item));
     const cb = conv.conv orelse return;
-    var msg = c.pam_message{ .msg_style = c.PAM_TEXT_INFO, .msg = "Touch your security key." };
+    var msg = c.pam_message{ .msg_style = style, .msg = text };
     var msgs = [_][*c]const c.pam_message{&msg};
     var resp: [*c]c.pam_response = null;
     if (cb(1, &msgs, &resp, conv.appdata_ptr) == c.PAM_SUCCESS and resp != null) {
         if (resp[0].resp != null) std.c.free(resp[0].resp);
         std.c.free(resp);
     }
+}
+
+fn changePinViaCli(uid: [*:0]const u8, old: [*:0]const u8, new: [*:0]const u8) bool {
+    var in_p: [2]c_int = undefined;
+    if (pipe(&in_p) != 0) return false;
+    const pid = fork();
+    if (pid < 0) {
+        _ = close(in_p[0]);
+        _ = close(in_p[1]);
+        return false;
+    }
+    if (pid == 0) {
+        _ = dup2(in_p[0], 0);
+        _ = close(in_p[0]);
+        _ = close(in_p[1]);
+        const nul = open("/dev/null", O_WRONLY | O_CLOEXEC, 0);
+        if (nul >= 0) _ = dup2(nul, 1);
+        const argv = [_:null]?[*:0]const u8{ SINTYKEY_BIN, "change-pin", "--uid", uid };
+        _ = execv(SINTYKEY_BIN, &argv);
+        _exit(127);
+    }
+    _ = close(in_p[0]);
+    var ok = true;
+    for ([_][]const u8{ std.mem.span(old), "\n", std.mem.span(new), "\n" }) |part| {
+        if (write(in_p[1], part.ptr, part.len) != @as(isize, @intCast(part.len))) ok = false;
+    }
+    _ = close(in_p[1]);
+    var status: c_int = 0;
+    _ = waitpid(pid, &status, 0);
+    return ok and (status & 0x7f) == 0 and ((status >> 8) & 0xff) == 0;
+}
+
+fn domainName(user: []const u8) bool {
+    if (user.len == 0 or user.len > 64) return false;
+    for (user, 0..) |ch, i| {
+        const alnum = std.ascii.isAlphanumeric(ch);
+        if (i == 0 and !alnum) return false;
+        if (!alnum and ch != '.' and ch != '_' and ch != '-') return false;
+    }
+    return true;
+}
+
+fn exists(path: [*:0]const u8) bool {
+    const fd = open(path, O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0) return false;
+    _ = close(fd);
+    return true;
+}
+
+fn domainUser(user: []const u8) bool {
+    if (!domainName(user)) return false;
+    var jb: [512]u8 = undefined;
+    const join = std.fmt.bufPrintZ(&jb, "{s}/join.json", .{bo.domain_dir}) catch return false;
+    if (!exists(join.ptr)) return false;
+    var nb: [80]u8 = undefined;
+    const nameZ = std.fmt.bufPrintZ(&nb, "{s}", .{user}) catch return false;
+    if (c.getpwnam(nameZ.ptr) == null) return true;
+    var lower: [64]u8 = undefined;
+    for (user, 0..) |ch, i| lower[i] = std.ascii.toLower(ch);
+    var ab: [600]u8 = undefined;
+    const acct = std.fmt.bufPrintZ(&ab, "{s}/accounts/{s}", .{ bo.domain_dir, lower[0..user.len] }) catch return false;
+    return exists(acct.ptr);
+}
+
+const DomainVerdict = enum { online, offline, wrong, disabled, expired, locked, needs_network, untrusted, conflict, failed };
+
+fn domainLogin(user: []const u8, password: [*:0]const u8) DomainVerdict {
+    const fd = socket(1, 1 | O_CLOEXEC, 0);
+    if (fd < 0) return .failed;
+    defer _ = close(fd);
+    const tv = extern struct { sec: i64, usec: i64 }{ .sec = 60, .usec = 0 };
+    _ = setsockopt(fd, 1, 20, &tv, @sizeOf(@TypeOf(tv)));
+    _ = setsockopt(fd, 1, 21, &tv, @sizeOf(@TypeOf(tv)));
+    var addr = extern struct { family: u16, path: [108]u8 }{ .family = 1, .path = [_]u8{0} ** 108 };
+    if (bo.domain_sock.len >= addr.path.len) return .failed;
+    @memcpy(addr.path[0..bo.domain_sock.len], bo.domain_sock);
+    if (connect(fd, &addr, @sizeOf(@TypeOf(addr))) != 0) return .failed;
+    var msg: [1024]u8 = undefined;
+    defer std.crypto.secureZero(u8, msg[0..]);
+    const line = std.fmt.bufPrint(&msg, "login\n{s}\n{s}\n", .{ user, std.mem.span(password) }) catch return .wrong;
+    var off: usize = 0;
+    while (off < line.len) {
+        const w = write(fd, line[off..].ptr, line.len - off);
+        if (w <= 0) return .failed;
+        off += @intCast(w);
+    }
+    var reply: [64]u8 = undefined;
+    var n: usize = 0;
+    while (n < reply.len) {
+        const r = read(fd, reply[n..].ptr, reply.len - n);
+        if (r <= 0) break;
+        n += @intCast(r);
+        if (std.mem.indexOfScalar(u8, reply[0..n], '\n') != null) break;
+    }
+    const got = std.mem.trimEnd(u8, reply[0..n], "\n");
+    const answers = [_]struct { []const u8, DomainVerdict }{
+        .{ "OK online", .online },               .{ "OK offline", .offline },
+        .{ "ERR Wrong", .wrong },                .{ "ERR Disabled", .disabled },
+        .{ "ERR Expired", .expired },            .{ "ERR Locked", .locked },
+        .{ "ERR NeedsNetwork", .needs_network }, .{ "ERR Untrusted", .untrusted },
+        .{ "ERR Conflict", .conflict },
+    };
+    for (answers) |a| if (std.mem.eql(u8, got, a[0])) return a[1];
+    return .failed;
+}
+
+fn domainAuthenticate(pamh: ?*c.pam_handle_t, user: [*c]const u8) c_int {
+    const name = std.mem.span(user);
+    const password = askSecret(pamh, "Password: ") orelse return c.PAM_CONV_ERR;
+    defer {
+        std.crypto.secureZero(u8, std.mem.span(password));
+        std.c.free(password);
+    }
+    const verdict = domainLogin(name, password);
+    switch (verdict) {
+        .online, .offline => {},
+        .failed => if (c.getpwnam(user) == null) return c.PAM_AUTHINFO_UNAVAIL,
+        .wrong => return c.PAM_AUTH_ERR,
+        .disabled => {
+            tell(pamh, c.PAM_ERROR_MSG, "This account is disabled.");
+            return c.PAM_AUTH_ERR;
+        },
+        .expired => {
+            tell(pamh, c.PAM_ERROR_MSG, "The password has expired. Change it on a device connected to your organisation.");
+            return c.PAM_AUTH_ERR;
+        },
+        .locked => {
+            tell(pamh, c.PAM_ERROR_MSG, "Too many attempts. Try again later.");
+            return c.PAM_AUTH_ERR;
+        },
+        .needs_network => {
+            tell(pamh, c.PAM_ERROR_MSG, "Connect to your organisation's network to sign in.");
+            return c.PAM_AUTH_ERR;
+        },
+        .untrusted => {
+            tell(pamh, c.PAM_ERROR_MSG, "The domain controller could not prove who it is.");
+            return c.PAM_AUTH_ERR;
+        },
+        .conflict => {
+            tell(pamh, c.PAM_ERROR_MSG, "A local account already uses this name.");
+            return c.PAM_AUTH_ERR;
+        },
+    }
+    const pw = c.getpwnam(user) orelse return c.PAM_USER_UNKNOWN;
+    if (accountLocked(user)) return c.PAM_AUTH_ERR;
+    var uidbuf: [16]u8 = undefined;
+    const uidZ = std.fmt.bufPrintZ(&uidbuf, "{d}", .{pw.*.pw_uid}) catch return c.PAM_AUTH_ERR;
+    var ce = unsealViaCli(uidZ.ptr, password) orelse blk: {
+        if (verdict != .online) return c.PAM_AUTH_ERR;
+        tell(pamh, c.PAM_TEXT_INFO, "Your password was changed. Enter the previous one to unlock your files.");
+        const old = askSecret(pamh, "Previous password: ") orelse return c.PAM_CONV_ERR;
+        defer {
+            std.crypto.secureZero(u8, std.mem.span(old));
+            std.c.free(old);
+        }
+        if (!changePinViaCli(uidZ.ptr, old, password)) return c.PAM_AUTH_ERR;
+        break :blk unsealViaCli(uidZ.ptr, password) orelse return c.PAM_AUTH_ERR;
+    };
+    defer std.crypto.secureZero(u8, ce.bytes[0..]);
+    const heap: *Key = @ptrCast(@alignCast(std.c.malloc(@sizeOf(Key)) orelse return c.PAM_BUF_ERR));
+    heap.* = ce;
+    if (c.pam_set_data(pamh, DATA_KEY, heap, keyCleanup) != c.PAM_SUCCESS) {
+        keyCleanup(pamh, heap, 0);
+        return c.PAM_AUTH_ERR;
+    }
+    return c.PAM_SUCCESS;
 }
 
 // unsealViaCli execs `sintykey unseal --uid <uid>`, pipes the PIN to its stdin, and
@@ -280,6 +454,7 @@ export fn pam_sm_authenticate(pamh: ?*c.pam_handle_t, flags: c_int, argc: c_int,
 
     var user: [*c]const u8 = null;
     if (c.pam_get_user(pamh, &user, null) != c.PAM_SUCCESS or user == null) return c.PAM_USER_UNKNOWN;
+    if (getuid() == 0 and !hasArg(argc, argv, "verify") and domainUser(std.mem.span(user))) return domainAuthenticate(pamh, user);
     const pw = c.getpwnam(user) orelse return c.PAM_USER_UNKNOWN;
     // Refuse a locked account BEFORE touching the PIN/TPM (covers auth-only callers
     // like the lockscreen, which never runs the account phase).

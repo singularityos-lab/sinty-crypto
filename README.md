@@ -15,7 +15,11 @@ a login with, and the TPM throttles repeated wrong PINs.
   PIN, and keeps a recovery copy sealed under a recovery secret (Argon2id and
   XChaCha20-Poly1305) for the forgotten-PIN case.
 - `pam_sinty/`: the PAM module. A correct PIN unseals the key and starts the
-  session, in place of pam_unix in greetd, login, lock and polkit.
+  session, in place of pam_unix in greetd, login, lock and polkit. On a device
+  joined to a domain, a user unknown here or created by sinty-domaind signs in
+  with the domain password: sinty-domaind checks it, and the home is sealed
+  with that password in place of a PIN. When the password was changed
+  elsewhere, the module asks for the previous one once and re-seals the home.
 
 ## Build
 

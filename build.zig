@@ -31,6 +31,8 @@ pub fn build(b: *std.Build) void {
     opts.addOption([]const u8, "seal_pcrs", b.option([]const u8, "seal-pcrs", "comma-separated PCR indices to bind sealed keys to") orelse "");
     // E2E-only: logs fscrypt key identifiers + key hashes to /var/lib/sinty/.dbg-*
     // for debugging fscrypt key issues across reboots. NEVER set in a release image.
+    opts.addOption([]const u8, "domain_dir", b.option([]const u8, "domain-dir", "sinty-domaind state directory") orelse "/var/lib/sinty-domaind");
+    opts.addOption([]const u8, "domain_sock", b.option([]const u8, "domain-sock", "sinty-domaind sign-in socket") orelse "/run/sinty-domaind.sock");
     opts.addOption(bool, "debug_e2e", b.option(bool, "debug-e2e", "E2E diagnostics to .dbg-* files") orelse false);
     opts.addOption(i32, "fido2_test_fd", b.option(i32, "fido2-test-fd", "inherited descriptor used as the only security key (tests)") orelse -1);
     const opts_mod = opts.createModule();
