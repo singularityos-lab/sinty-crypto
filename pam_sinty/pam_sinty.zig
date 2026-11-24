@@ -199,7 +199,7 @@ fn domainUser(user: []const u8) bool {
     return exists(acct.ptr);
 }
 
-const DomainVerdict = enum { online, offline, wrong, disabled, expired, locked, needs_network, untrusted, conflict, failed };
+const DomainVerdict = enum { online, offline, wrong, disabled, expired, needs_network, untrusted, conflict, failed };
 
 fn domainLogin(user: []const u8, password: [*:0]const u8) DomainVerdict {
     const fd = socket(1, 1 | O_CLOEXEC, 0);
@@ -231,11 +231,10 @@ fn domainLogin(user: []const u8, password: [*:0]const u8) DomainVerdict {
     }
     const got = std.mem.trimEnd(u8, reply[0..n], "\n");
     const answers = [_]struct { []const u8, DomainVerdict }{
-        .{ "OK online", .online },               .{ "OK offline", .offline },
-        .{ "ERR Wrong", .wrong },                .{ "ERR Disabled", .disabled },
-        .{ "ERR Expired", .expired },            .{ "ERR Locked", .locked },
-        .{ "ERR NeedsNetwork", .needs_network }, .{ "ERR Untrusted", .untrusted },
-        .{ "ERR Conflict", .conflict },
+        .{ "OK online", .online },        .{ "OK offline", .offline },
+        .{ "ERR Wrong", .wrong },         .{ "ERR Disabled", .disabled },
+        .{ "ERR Expired", .expired },     .{ "ERR NeedsNetwork", .needs_network },
+        .{ "ERR Untrusted", .untrusted }, .{ "ERR Conflict", .conflict },
     };
     for (answers) |a| if (std.mem.eql(u8, got, a[0])) return a[1];
     return .failed;
@@ -259,10 +258,6 @@ fn domainAuthenticate(pamh: ?*c.pam_handle_t, user: [*c]const u8) c_int {
         },
         .expired => {
             tell(pamh, c.PAM_ERROR_MSG, "The password has expired. Change it on a device connected to your organisation.");
-            return c.PAM_AUTH_ERR;
-        },
-        .locked => {
-            tell(pamh, c.PAM_ERROR_MSG, "Too many attempts. Try again later.");
             return c.PAM_AUTH_ERR;
         },
         .needs_network => {
