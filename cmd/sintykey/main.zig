@@ -1101,7 +1101,7 @@ fn secureDir(path: [*:0]const u8, mode: c_uint, root_only: bool) bool {
 
 // cmdMkdirs creates the early-boot sinty runtime dirs, replacing a /bin/sh -c one-liner
 // in the boot unit (Tier-1 hardening: no shell in the pre-sysinit path):
-//   /run/sinty     1777           session registry (users write session-<uid>)
+//   /run/sinty     1777           session registry (users write session-<id>)
 //   /run/sintykey  0700 root:root transient CE-key/PIN scratch
 fn cmdMkdirs(_: []const [:0]const u8) u8 {
     if (!secureDir("/run/sinty", 0o1777, false)) die("mkdirs: /run/sinty");
