@@ -5,6 +5,8 @@
 //!   seal   <keyfile> <pinfile> <pub_out> <priv_out>
 //!   unseal <pinfile> <pub> <priv> <out>
 //!   verify <pinfile> <pub> <priv>                 (exit 0 ok / 1 wrong-PIN)
+//!   sign-create <authfile> <pub_out> <priv_out> <point_out>
+//!   sign   <authfile> <pub> <priv> <digestfile> <sig_out>
 //!
 //! The TCTI is chosen by the SINTYKEY_TCTI env (e.g. "swtpm:host=127.0.0.1,port=2321"
 //! in a VM); default is the kernel resource manager on hardware. The PIN is read from a
@@ -592,6 +594,113 @@ fn counterBump(ctx: *c.ESYS_CONTEXT, arg: []const u8) void {
     printLine("{d}", .{counterValue(ctx, h)});
 }
 
+fn signTemplate() c.TPM2B_PUBLIC {
+    var t = std.mem.zeroes(c.TPM2B_PUBLIC);
+    const p = &t.publicArea;
+    p.type = c.TPM2_ALG_ECC;
+    p.nameAlg = c.TPM2_ALG_SHA256;
+    p.objectAttributes = c.TPMA_OBJECT_FIXEDTPM | c.TPMA_OBJECT_FIXEDPARENT |
+        c.TPMA_OBJECT_SENSITIVEDATAORIGIN | c.TPMA_OBJECT_USERWITHAUTH | c.TPMA_OBJECT_SIGN_ENCRYPT;
+    p.parameters.eccDetail.symmetric.algorithm = c.TPM2_ALG_NULL;
+    p.parameters.eccDetail.scheme.scheme = c.TPM2_ALG_ECDSA;
+    p.parameters.eccDetail.scheme.details.ecdsa.hashAlg = c.TPM2_ALG_SHA256;
+    p.parameters.eccDetail.curveID = c.TPM2_ECC_NIST_P256;
+    p.parameters.eccDetail.kdf.scheme = c.TPM2_ALG_NULL;
+    return t;
+}
+
+fn pad32(dst: []u8, src: []const u8) void {
+    if (src.len > 32) fatal("ecc coordinate too long", .{});
+    @memset(dst[0 .. 32 - src.len], 0);
+    @memcpy(dst[32 - src.len .. 32], src);
+}
+
+fn signCreate(ctx: *c.ESYS_CONTEXT, authfile: [:0]const u8, pubOut: [:0]const u8, privOut: [:0]const u8, pointOut: [:0]const u8) void {
+    const primary = ensurePrimary(ctx);
+    var abuf: [256]u8 = undefined;
+    const ab = readFile(authfile, &abuf);
+    var inSensitive = std.mem.zeroes(c.TPM2B_SENSITIVE_CREATE);
+    inSensitive.sensitive.userAuth = authFromPin(ab);
+    std.crypto.secureZero(u8, &abuf);
+    const inPublic = signTemplate();
+    const outsideInfo = std.mem.zeroes(c.TPM2B_DATA);
+    const creationPCR = std.mem.zeroes(c.TPML_PCR_SELECTION);
+    var outPrivate: ?*c.TPM2B_PRIVATE = null;
+    var outPublic: ?*c.TPM2B_PUBLIC = null;
+    ck(c.Esys_Create(ctx, primary, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &inSensitive, &inPublic, &outsideInfo, &creationPCR, &outPrivate, &outPublic, null, null, null), "create(sign)");
+    defer c.Esys_Free(outPrivate);
+    defer c.Esys_Free(outPublic);
+    std.crypto.secureZero(u8, std.mem.asBytes(&inSensitive));
+
+    var mbuf: [4096]u8 = undefined;
+    var off: usize = 0;
+    ck(c.Tss2_MU_TPM2B_PUBLIC_Marshal(outPublic, &mbuf, mbuf.len, &off), "marshal pub");
+    writeFileSecret(pubOut, mbuf[0..off]);
+    off = 0;
+    ck(c.Tss2_MU_TPM2B_PRIVATE_Marshal(outPrivate, &mbuf, mbuf.len, &off), "marshal priv");
+    writeFileSecret(privOut, mbuf[0..off]);
+
+    const point = outPublic.?.publicArea.unique.ecc;
+    var xy: [64]u8 = undefined;
+    pad32(xy[0..32], point.x.buffer[0..point.x.size]);
+    pad32(xy[32..64], point.y.buffer[0..point.y.size]);
+    writeFileSecret(pointOut, &xy);
+}
+
+fn signDigest(ctx: *c.ESYS_CONTEXT, authfile: [:0]const u8, pubIn: [:0]const u8, privIn: [:0]const u8, digestfile: [:0]const u8, sigOut: [:0]const u8) u8 {
+    const primary = ensurePrimary(ctx);
+    var pbuf: [4096]u8 = undefined;
+    var rbuf: [4096]u8 = undefined;
+    const pb = readFile(pubIn, &pbuf);
+    const rb = readFile(privIn, &rbuf);
+    var pubBlob = std.mem.zeroes(c.TPM2B_PUBLIC);
+    var privBlob = std.mem.zeroes(c.TPM2B_PRIVATE);
+    var off: usize = 0;
+    ck(c.Tss2_MU_TPM2B_PUBLIC_Unmarshal(&pbuf, pb.len, &off, &pubBlob), "unmarshal pub");
+    off = 0;
+    ck(c.Tss2_MU_TPM2B_PRIVATE_Unmarshal(&rbuf, rb.len, &off, &privBlob), "unmarshal priv");
+
+    var item: c.ESYS_TR = c.ESYS_TR_NONE;
+    const lrc = c.Esys_Load(ctx, primary, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &privBlob, &pubBlob, &item);
+    if (lrc != c.TSS2_RC_SUCCESS) fatal("load(sign) failed: 0x{x} ({s})", .{ lrc, c.Tss2_RC_Decode(lrc) });
+    defer _ = c.Esys_FlushContext(ctx, item);
+
+    var abuf: [256]u8 = undefined;
+    const ab = readFile(authfile, &abuf);
+    var auth = authFromPin(ab);
+    std.crypto.secureZero(u8, &abuf);
+    ck(c.Esys_TR_SetAuth(ctx, item, &auth), "set auth");
+    std.crypto.secureZero(u8, std.mem.asBytes(&auth));
+
+    var dbuf: [64]u8 = undefined;
+    const db = readFile(digestfile, &dbuf);
+    if (db.len != 32) fatal("digest must be 32 bytes", .{});
+    var digest = std.mem.zeroes(c.TPM2B_DIGEST);
+    digest.size = 32;
+    @memcpy(digest.buffer[0..32], db);
+
+    var scheme = std.mem.zeroes(c.TPMT_SIG_SCHEME);
+    scheme.scheme = c.TPM2_ALG_ECDSA;
+    scheme.details.ecdsa.hashAlg = c.TPM2_ALG_SHA256;
+    var validation = std.mem.zeroes(c.TPMT_TK_HASHCHECK);
+    validation.tag = c.TPM2_ST_HASHCHECK;
+    validation.hierarchy = c.TPM2_RH_NULL;
+    var sig: ?*c.TPMT_SIGNATURE = null;
+    const src = c.Esys_Sign(ctx, item, c.ESYS_TR_PASSWORD, c.ESYS_TR_NONE, c.ESYS_TR_NONE, &digest, &scheme, &validation, &sig);
+    if (src != c.TSS2_RC_SUCCESS) {
+        noteLockout(src);
+        if (locked_out) return EXIT_LOCKOUT;
+        fatal("sign failed: 0x{x} ({s})", .{ src, c.Tss2_RC_Decode(src) });
+    }
+    defer c.Esys_Free(sig);
+    const ecdsa = sig.?.signature.ecdsa;
+    var rs: [64]u8 = undefined;
+    pad32(rs[0..32], ecdsa.signatureR.buffer[0..ecdsa.signatureR.size]);
+    pad32(rs[32..64], ecdsa.signatureS.buffer[0..ecdsa.signatureS.size]);
+    writeFileSecret(sigOut, &rs);
+    return 0;
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     var it = std.process.Args.Iterator.init(init.args);
     var argv: [8][:0]const u8 = undefined;
@@ -601,7 +710,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         argv[argc] = a;
         argc += 1;
     }
-    if (argc < 2) fatal("usage: sintykey-tpm ensure-primary|seal|unseal|verify|lockout-wait|lock-read|lock-unlock|lock-relock|verity-read|verity-set-off|verity-set-on|ek-fingerprint|counter-define|counter-read|counter-bump ...", .{});
+    if (argc < 2) fatal("usage: sintykey-tpm ensure-primary|seal|unseal|verify|sign-create|sign|lockout-wait|lock-read|lock-unlock|lock-relock|verity-read|verity-set-off|verity-set-on|ek-fingerprint|counter-define|counter-read|counter-bump ...", .{});
     const cmd = argv[1];
     const ctx = esysInit(); // one-shot CLI: the process exits right after, so the OS reclaims the ESYS ctx
 
@@ -628,6 +737,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const ok = tryUnseal(ctx, argv[2], argv[3], argv[4], &out) != null;
         std.crypto.secureZero(u8, &out);
         return if (ok) 0 else if (locked_out) EXIT_LOCKOUT else 1;
+    } else if (std.mem.eql(u8, cmd, "sign-create")) {
+        if (argc < 6) fatal("sign-create needs <authfile> <pub_out> <priv_out> <point_out>", .{});
+        signCreate(ctx, argv[2], argv[3], argv[4], argv[5]);
+    } else if (std.mem.eql(u8, cmd, "sign")) {
+        if (argc < 7) fatal("sign needs <authfile> <pub> <priv> <digestfile> <sig_out>", .{});
+        return signDigest(ctx, argv[2], argv[3], argv[4], argv[5], argv[6]);
     } else if (std.mem.eql(u8, cmd, "lockout-wait")) {
         return lockoutWait(ctx);
     } else if (std.mem.eql(u8, cmd, "lock-read")) {

@@ -18,7 +18,14 @@ sintykey-tpm ek-fingerprint                          # stdout: hex SHA-256 of th
 sintykey-tpm counter-define                          # stdout: index of a new NV counter
 sintykey-tpm counter-read <index>                    # stdout: value
 sintykey-tpm counter-bump <index>                    # stdout: new value
+sintykey-tpm sign-create <authfile> <pub_out> <priv_out> <point_out>
+sintykey-tpm sign <authfile> <pub> <priv> <digestfile> <sig_out>
 ```
+
+`sign-create` makes an ECDSA P-256 key that never leaves the TPM and writes its
+public point as 64 bytes, x then y. `sign` signs a 32-byte SHA-256 digest and
+writes r then s, 32 bytes each. A wrong auth value counts against the
+dictionary-attack lockout; while locked out `sign` exits 75.
 
 The fingerprint identifies the TPM: the primary is derived from the endorsement
 seed, so it is the same on every boot. Counters are `TPM2_NT_COUNTER` indices
